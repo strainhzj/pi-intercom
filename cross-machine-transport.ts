@@ -19,6 +19,8 @@ export interface CrossMachineDeps {
   remoteCommand?: string;
   discoveryTimeoutMs?: number;
   deliveryTimeoutMs?: number;
+  /** Optional local guard; in particular rechecked after discovery, before SSH delivery. */
+  beforeSend?: () => void;
 }
 
 export interface CrossMachineDelivery {
@@ -95,7 +97,11 @@ export async function sendCrossMachine(
   origin: CrossMachineOrigin,
   deps: CrossMachineDeps = {},
 ): Promise<CrossMachineDelivery> {
-  const run = deps.run ?? runCommand;
+  const invoke = deps.run ?? runCommand;
+  const run: CommandRunner = (...args) => {
+    deps.beforeSend?.();
+    return invoke(...args);
+  };
   const herdr = deps.herdrBin ?? process.env.HERDR_BIN_PATH ?? "herdr";
   const remoteCommand = deps.remoteCommand ?? "pi-intercom";
   if (remoteCommand.trim().length === 0) throw new Error("Remote command must not be empty.");

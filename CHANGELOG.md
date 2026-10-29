@@ -5,6 +5,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ## [Unreleased]
 
 ### Added
+- Opt into `confirmProactive` to let agents propose new `send`/`ask`/`handover` communications for user approval before sending or opening a target session. Optional `trigger` is explanation only; neither it nor `retryOf` bypasses approval. Genuine replies and human commands keep their existing confirmation rules. TUI/RPC approval covers only the current proposal, combines with `confirmSend` into one dialog, and fails closed without a UI. Pending approval responds to cancellation/session replacement; concurrent asks cannot send twice or reject each other's waiter. CLI/outbox/supervisor policies are unchanged.
 - Extension channels have `unregister()`. A session can leave a namespace it registered, which frees one of its 32 extension slots and, if it owned the namespace, hands ownership to the next owner-eligible member. See the README's Extension channels section. Thanks to [@wayne930242](https://github.com/wayne930242) for #184.
 
 ### Changed

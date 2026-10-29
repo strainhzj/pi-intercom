@@ -263,7 +263,20 @@ Pi sessions promise these receipts when they register, so a send to one reports 
 
 Cancellation is explicit: call `intercom({ action: "cancel", messageId })` to request cancellation of a message you originally sent. A held message is dropped with `cancelled`; an already-injected message reports `cancellation_requested` rather than pretending it removed work from Pi's queues. Supersede is also explicit: pass `supersedes: "old-message-id"` on a new `send` or `ask`. The broker only allows same sender → same receiver supersedes, marks the old message `superseded`, and sends the replacement with a new ID; a held old message is dropped, while an already-steered one may still be processed. Retries are never automatic; a retry should be a new authored message, optionally linked with `retryOf`.
 
-The planner typically uses `send`. If you prefer manual approval for outgoing non-reply messages, turn on `confirmSend: true`. The worker uses `ask` for everything (no confirmation needed, gets answers inline), so it can operate autonomously either way.
+The planner typically uses `send`. If you prefer manual confirmation of ordinary or inferred sends, turn on `confirmSend: true`. This legacy option does not confirm `ask`; opt into `confirmProactive` below to approve new communication proposals from the agent, including asks.
+
+### Approving agent-initiated calls
+
+Agents may choose another session and propose contacting it — including when prompted by memory rather than the current request. Enable `confirmProactive: true` to leave that initiative intact while giving the user the final decision:
+
+- Every new tool-issued `send`, `ask`, or `handover` shows an `Approve intercom call` dialog with the target, message/summary, attachments, and any planned Herdr pane/Pi launch. Nothing is delivered or opened before approval. Each approval covers only that proposal, not later messages.
+- Optional `trigger` values (`"user"`, `"memory"`, `"initiative"`) explain the proposal; they never authorize it. `retryOf` does not bypass approval either. Natural-language user requests still get a dialog; the extension does not guess whether the model already has permission.
+- Genuine replies retain existing behavior: `reply`, validated `replyTo` sends, and sends inferred as the answer to a pending ask do not add this approval. Existing `confirmSend` rules still apply, including confirmation of inferred replies. An `ask` is a new request even if it carries `replyTo`.
+- The human-invoked `/handover` command adds no new approval but still respects `confirmSend`. Read-only discovery/status tools do not prompt. Enabling both options never adds a second dialog to the same proposal.
+- Declining, cancelling, or losing the session invalidates the proposal. Without a UI (print/JSON modes), new proposals fail closed with no pane creation or delivery; use an interactive session to approve them. TUI and RPC dialogs are supported and are queued rather than overwriting another confirmation.
+- Address proposals by an exact session name or ID. After approval, an unknown name is not retried against a different name-prefix match. For newly opened panes, only that pane's newly registered peer is accepted; another session appearing in the same directory is not a substitute.
+
+This is a tool-layer interaction, not an OS sandbox or broker-wide permission system. CLI clients, extension outbox requests, and `contact_supervisor` keep their existing policies. The option is off by default.
 
 ### Ask timeouts and liveness
 
@@ -441,9 +454,9 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 **`list`** — Returns the current session plus other active intercom-connected sessions with name, short ID, working directory, model, live status, and explicit Herdr location. For Herdr-hosted sessions, the broker joins the process's stable Pi session identity against one fresh `herdr api snapshot` per list request and returns readable workspace/tab labels together with their opaque IDs and the diagnostic pane ID. Workspace and tab are not registration-time values and are not cached, so moving a pane is reflected by the next list. `herdrLocation.status` is `current`, `not_hosted`, or `unavailable`; unavailable results include a reason such as `pane_missing` or `herdr_unavailable` rather than inviting inference from cwd or session name. A Herdr command failure does not prevent the rest of the roster from being returned. When no connected session advertises Herdr hosting, `list` does not invoke Herdr and preserves the ordinary roster shape and rendering without location lines. `herdrPaneId` is the launch alias and may be stale after a move; consumers needing the current diagnostic pane ID must use `herdrLocation.paneId`. Pane IDs are diagnostic metadata, not intercom addressing handles. Status is derived automatically from Pi lifecycle events: `idle`, `thinking`, or `tool:<name>`.
 
-**`send`** — Sends a message to the specified session and returns immediately after delivery. If the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply `send` to a different target is rejected so a guessed parent/root CWD cannot receive an accidental reply. Zero or multiple pending-ask matches remain unthreaded sends outside the active ask turn. Set `confirmSend: true` to confirm ordinary and inferred sends. A caller-supplied `replyTo` skips confirmation. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
+**`send`** — Sends a message to the specified session and returns immediately after delivery. If the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply `send` to a different target is rejected so a guessed parent/root CWD cannot receive an accidental reply. Zero or multiple pending-ask matches remain unthreaded sends outside the active ask turn. Set `confirmSend: true` to confirm ordinary and inferred sends. A caller-supplied `replyTo` skips confirmation. Optional `trigger` explains the proposal but never grants permission; with `confirmProactive: true`, every new communication needs approval first, while verified replies retain existing behavior. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
 
-**`ask`** — Requires a currently connected recipient, sends a message, and waits for the recipient to reply (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). A disconnected target fails immediately rather than queueing a blocking request. The reply is returned as the tool result. No confirmation dialog. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working. The same `to`, `cwd`, and `openProjectPaneIfMissing` targeting rules apply.
+**`ask`** — Requires a currently connected recipient, sends a message, and waits for the recipient to reply (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). A disconnected target fails immediately rather than queueing a blocking request. The reply is returned as the tool result. No `confirmSend` dialog — if you're asking and waiting, the intent is clear — but `confirmProactive: true` requires approval for every new tool-issued ask. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working. The same `to`, `cwd`, and `openProjectPaneIfMissing` targeting rules apply.
 
 **`handover`** — Summarizes the current session with the current model and sends the summary to the target, which acts on it. `message` is the optional next task. Targeting, confirmation, and delivery work exactly like `send`, including `name@machine` targets. `replyTo`, `supersedes`, `retryOf`, and `attachments` are rejected. See [Workflow: Handing Over a Session](#workflow-handing-over-a-session).
 
@@ -474,6 +487,7 @@ Create `~/.pi/agent/intercom/config.json`:
   "brokerCommand": "npx",
   "brokerArgs": ["--no-install", "tsx"],
   "confirmSend": false,
+  "confirmProactive": false,
   "inboundTrigger": "always",
   "busyDelivery": "steer",
   "enabled": true,
@@ -491,6 +505,7 @@ Create `~/.pi/agent/intercom/config.json`:
 | `brokerCommand` | `"npx"` | Advanced trusted override for the broker executable. The default value is hardened internally to run the broker in the current Node executable with the resolved bundled `tsx` loader instead of resolving `npx` through `PATH`. A custom command is spawned directly without a shell, so on Windows it must name an executable such as `bun`, not a `.cmd` shim such as `npx`. |
 | `brokerArgs` | `["--no-install", "tsx"]` | Advanced trusted arguments passed to custom `brokerCommand` before the broker script path |
 | `confirmSend` | false | Show a confirmation dialog before ordinary or inferred sends from an interactive session with UI; caller-supplied `replyTo` skips it |
+| `confirmProactive` | false | Approve each new tool-issued `send`/`ask`/`handover` proposal before delivery or pane creation. `trigger` and `retryOf` never bypass it. Genuine replies and human commands retain existing confirmation rules; no UI means new proposals are blocked |
 | `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
 | `busyDelivery` | `"steer"` | `"steer"` promptly steers peers into active interactive runs. Opt into `"human-first"` to hold peers until a turn boundary with no pending human input; one held peer is released per turn. Non-interactive busy behavior is unchanged. |
 | `enabled` | true | Enable/disable intercom entirely |
@@ -683,7 +698,7 @@ Runtime files live at `~/.pi/agent/intercom/` by default, or `$PI_CODING_AGENT_D
 - `broker.port.json` — Dynamic localhost TCP endpoint, only when Windows TCP transport is explicitly enabled
 - `config.json` — User configuration
 
-Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `busyDelivery` (`steer` or `human-first`), `replyHint`, `confirmSend`, and advanced broker launch overrides.
+Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `busyDelivery` (`steer` or `human-first`), `replyHint`, `confirmSend`, `confirmProactive`, and advanced broker launch overrides.
 
 ## Design Decisions
 

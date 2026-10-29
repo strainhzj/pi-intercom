@@ -36,6 +36,14 @@ intercom({ action: "reply", message, to? })        # answers an ask; `to` picks 
 - **`send` can answer.** When exactly one unanswered ask from the target is waiting on you, `send` goes out as the reply to it.
 - **Late replies** after the ask closed arrive as a plain message marked late and don't end the asker's wait.
 
+## Proposing communication for approval
+
+- You may propose contacting a peer, including from memory. With `confirmProactive: true`, each new tool-issued `send`, `ask`, or `handover` needs user approval before delivery or opening a session. Approval covers only that proposal.
+- Optional `trigger` (`"user"`, `"memory"`, `"initiative"`) explains why; no value, omitted field, or `retryOf` grants permission. Natural-language user requests still get a dialog.
+- Choose an exact peer name or an id from `list`; unknown names are not silently redirected to a name-prefix match after approval.
+- Genuine replies keep their existing `confirmSend` rules. An `ask` is a new request even with `replyTo`. Human `/handover` commands add no new approval; discovery/status actions never prompt.
+- Without a UI, report that approval needs an interactive session. Do not switch tools or metadata to bypass a refusal, or retry a declined/cancelled proposal unprompted. CLI/outbox/supervisor policies are unchanged.
+
 ## Supervising pi-subagents
 
 A child started by `pi-subagents` reaches its supervisor through `contact_supervisor`. Its messages start with "Subagent needs a supervisor decision.", "Subagent requests a structured supervisor interview." or "Subagent progress update."
@@ -60,6 +68,6 @@ When several children wait, run `pending`, then `reply` with `to`. As a child, u
 ## Look up
 
 - Mailbox, liveness, timeouts → [README: send vs ask](../../README.md#send-vs-ask)
-- `confirmSend` and other settings → [README: Config](../../README.md#config)
+- `confirmSend`, `confirmProactive` and other settings → [README: Config](../../README.md#config)
 - CLI scripting and other machines → [README: Scripting and Remote Machines](../../README.md#scripting-and-remote-machines)
 - Extension channels for other extensions → [README: Extension channels](../../README.md#extension-channels)

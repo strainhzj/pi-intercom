@@ -94,6 +94,46 @@ test("loadConfig accepts inboundTrigger replies policy", async () => {
   }
 });
 
+test("loadConfig defaults confirmProactive to false", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().confirmProactive, false);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig accepts confirmProactive", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ confirmProactive: true }));
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().confirmProactive, true);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig rejects invalid confirmProactive values", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ confirmProactive: "yes" }));
+    await withAgentDir(root, () => {
+      assert.throws(
+        () => loadConfig(),
+        /Failed to load intercom config.*"confirmProactive" must be a boolean/,
+      );
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig ignores obsolete toolVisibility values", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
   try {

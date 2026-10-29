@@ -30,6 +30,8 @@ interface SendOptions {
   retryOf?: string;
   provenance?: MessageProvenance;
   crossMachine?: CrossMachineProvenance;
+  /** Optional local cancellation/lifecycle guard, checked after routing awaits and before writing. */
+  beforeSend?: () => void;
 }
 
 export interface SendResult extends DeliveryDetails {
@@ -678,6 +680,7 @@ export class IntercomClient extends EventEmitter {
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
+        options.beforeSend?.();
         writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}) });
       } catch (error) {
         clearTimeout(timeout);

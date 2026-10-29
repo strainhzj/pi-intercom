@@ -129,6 +129,42 @@ test("non-JSON and incompatible remote output report incompatible relay support"
   }
 });
 
+test("delivery guard prevents SSH after cancellation during remote discovery", async () => {
+  let release!: () => void;
+  let discovered!: () => void;
+  const discoveryEntered = new Promise<void>((resolve) => { discovered = resolve; });
+  const discoveryRelease = new Promise<void>((resolve) => { release = resolve; });
+  const controller = new AbortController();
+  const calls: string[] = [];
+  const run: CommandRunner = async (command, args) => {
+    calls.push(command);
+    if (command === "herdr" && args[0] !== "machine") {
+      discovered();
+      await discoveryRelease;
+    }
+    return discoveryResult(command, args) ?? { code: 0, stdout: '{"ok":true}', stderr: "" };
+  };
+  const pending = sendCrossMachine("reviewer@workstation", "Do not deliver late", origin, {
+    run, herdrBin: "herdr",
+    beforeSend: () => { if (controller.signal.aborted) throw new Error("Cancelled"); },
+  });
+  await discoveryEntered;
+  controller.abort();
+  release();
+  await assert.rejects(pending, /Cancelled/);
+  assert.equal(calls.includes("ssh"), false);
+});
+
+test("delivery guard runs before discovery when the sending session has already ended", async () => {
+  const calls: string[] = [];
+  await assert.rejects(sendCrossMachine("reviewer@workstation", "No longer valid", origin, {
+    herdrBin: "herdr",
+    run: async (command, args) => { calls.push(command); return discoveryResult(command, args)!; },
+    beforeSend: () => { throw new Error("Session changed"); },
+  }), /Session changed/);
+  assert.equal(calls.length, 0);
+});
+
 test("structured remote failure preserves the reported error", async () => {
   const run: CommandRunner = async (command, args) => discoveryResult(command, args) ?? {
     code: 1,
