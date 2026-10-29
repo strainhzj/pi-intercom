@@ -5512,6 +5512,1719 @@ test("confirmSend decline blocks explicit cross-machine transport after fail-clo
   });
 });
 
+function deferredApproval<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function withApprovalHarness(
+  options: NonNullable<Parameters<typeof createExtensionHarness>[1]>,
+  run: (probe: {
+    harness: ReturnType<typeof createExtensionHarness>;
+    tool: CapturedTool;
+    planner: InstanceType<typeof IntercomClient>;
+    orchestrator: InstanceType<typeof IntercomClient>;
+    worker: SessionInfo;
+    received: Message[];
+  }) => Promise<void>,
+  overrides: Record<string, unknown> = {},
+): Promise<void> {
+  await withIntercomConfig({ confirmProactive: true, ...overrides }, async () => {
+    const { planner, orchestrator, cleanup } = await setupClients();
+    const harness = createExtensionHarness("approval-regression-worker", options);
+    const received: Message[] = [];
+    planner.on("message", (_from: SessionInfo, message: Message) => { received.push(message); });
+    try {
+      const { default: extension } = await import("./index.ts");
+      extension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const worker = await waitForSessionByName(planner, "approval-regression-worker");
+      const tool = harness.tools.find((entry) => entry.name === "intercom")!;
+      await run({ harness, tool, planner, orchestrator, worker, received });
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
+}
+
+const approvalTestOptions = { concurrency: false, timeout: 15_000 };
+
+// Handovers generate a summary before routing. Observe the follower's actual
+// roster lookup, rather than assuming it has joined after merely starting it.
+async function startApprovalFollower(workerId: string, start: () => Promise<CapturedToolResult>) {
+  const routed = deferredApproval<void>();
+  const originalList = IntercomClient.prototype.listSessions;
+  let settled = false;
+  IntercomClient.prototype.listSessions = async function (options) {
+    const sessions = await originalList.call(this, options);
+    if (this.sessionId === workerId) routed.resolve();
+    return sessions;
+  };
+  try {
+    const pending = start();
+    void pending.then(() => { settled = true; routed.resolve(); }, () => { settled = true; routed.resolve(); });
+    await routed.promise;
+    // Let routing continuations (and any additional lookup) reach the pending
+    // approval. The leader's UI promise remains unresolved throughout.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    return { pending, isPending: () => !settled };
+  } finally {
+    IntercomClient.prototype.listSessions = originalList;
+  }
+}
+
+test("confirmProactive reuses one session-ID approval across repeated sends and name/short-ID/full-ID/cwd aliases", approvalTestOptions, async (t) => {
+  const previews: string[] = [];
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async (_title: string, preview: string) => {
+    previews.push(preview);
+    return previews.length === 1;
+  } } }, async ({ tool, harness, planner, orchestrator, received }) => {
+    await orchestrator.disconnect(); // Leave planner as the sole peer for cwd-only routing.
+    const routes = [{ to: "planner" }, { to: planner.sessionId!.slice(0, 8) }, { to: planner.sessionId! }, { cwd: repoDir }, { to: "PLANNER" }];
+    for (const [index, route] of routes.entries()) {
+      const result = await tool.execute(`approval-alias-${index}`, {
+        action: "send", ...route, message: "Identical payload is not deduplicated",
+      }, t.signal, undefined, harness.ctx);
+      assert.equal(result.details?.delivered, true, JSON.stringify(route));
+    }
+    await waitForCondition(() => received.length === routes.length, "each approved send arrives separately");
+    assert.equal(previews.length, 1);
+    assert.equal(new Set(received.map((message) => message.id)).size, routes.length);
+    assert.ok(received.every((message) => message.content.text === "Identical payload is not deduplicated"));
+    assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, routes.length);
+  });
+});
+
+test("confirmProactive previews resolved session names for ID/cwd input and falls back to the ID only when unnamed", approvalTestOptions, async (t) => {
+  for (const route of ["full-id", "short-id", "cwd", "unnamed"]) {
+    const previews: string[] = [];
+    await withApprovalHarness({ hasUI: true, ui: { confirm: async (_title: string, preview: string) => { previews.push(preview); return false; } } }, async ({ tool, harness, planner, orchestrator, received }) => {
+      const unnamed = new IntercomClient();
+      try {
+        if (route === "cwd") await orchestrator.disconnect();
+        if (route === "unnamed") {
+          await unnamed.connect({ cwd: repoDir, model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "approval-unnamed-target-id");
+        }
+        const expectedName = route === "unnamed" ? unnamed.sessionId! : "planner";
+        const args = route === "cwd" ? { cwd: repoDir }
+          : { to: route === "unnamed" ? unnamed.sessionId! : route === "short-id" ? planner.sessionId!.slice(0, 8) : planner.sessionId! };
+        for (const [index, action] of ["send", "ask", "handover"].entries()) {
+          const result = await tool.execute(`approval-target-name-${route}-${action}`, { action, ...args, message: "Review destination identity" }, t.signal, undefined, approvalHandoverContext(harness));
+          assert.equal(result.details?.declined, true);
+          assert.equal(previews.length, index + 1);
+          const preview = previews[index]!;
+          const verb = action === "ask" ? "ask" : action === "handover" ? "hand over to" : "send a message to";
+          assert.ok(preview.includes(`${verb} "${expectedName}"`), preview);
+          assert.match(preview, /session\s+ID/i);
+          assert.match(preview, /(?:no |without |not |won't )[^.\n]*(?:approv|confirm|ask|prompt)/i, "explain that later calls to this ID need no further approval");
+          assert.match(preview, /until[^.\n]*(?:reload|restart)/i, "explain the runtime lifetime of approval");
+        }
+        assert.equal(received.length, 0);
+      } finally { await unnamed.disconnect().catch(() => undefined); }
+    });
+  }
+});
+
+test("confirmProactive follows renamed/reconnected session IDs but not a new session with the same name or short-ID prefix", approvalTestOptions, async (t) => {
+  const previews: string[] = [];
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async (_title: string, preview: string) => { previews.push(preview); return previews.length === 1; } } }, async ({ tool, harness, planner, orchestrator, received }) => {
+    const originalId = planner.sessionId!;
+    const replacement = new IntercomClient();
+    const replacementMessages: Message[] = [];
+    replacement.on("message", (_from: SessionInfo, message: Message) => replacementMessages.push(message));
+    try {
+      assert.equal((await tool.execute("approval-before-rename", { action: "send", to: "planner", message: "Approve this ID" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+      planner.updatePresence({ name: "renamed-planner" });
+      assert.equal((await waitForSessionByName(planner, "renamed-planner")).id, originalId);
+      assert.equal((await tool.execute("approval-after-rename", { action: "send", to: "renamed-planner", message: "Same ID after rename" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+      assert.equal(previews.length, 1, "renaming does not revoke permission for the same ID");
+      await waitForCondition(() => received.length === 2, "both messages reach the original ID");
+      await planner.disconnect();
+      await waitForNoSessionId(orchestrator, originalId);
+      await connectClientWithScope(planner, process.env.PI_INTERCOM_SCOPE_ID, originalId, "renamed-planner");
+      const reconnected = await tool.execute("approval-reconnected-target", { action: "send", to: originalId, message: "Same full ID on a new endpoint" }, t.signal, undefined, harness.ctx);
+      assert.equal(reconnected.details?.delivered, true);
+      assert.equal(previews.length, 1, "target endpoint churn does not revoke a full-ID approval");
+      await waitForCondition(() => received.length === 3, "the same ID stays approved after target reconnection");
+      await planner.disconnect();
+      await waitForNoSessionId(orchestrator, originalId);
+      const replacementId = `${originalId.slice(0, 8)}-different-full-session-id`;
+      await connectClientWithScope(replacement, process.env.PI_INTERCOM_SCOPE_ID, replacementId, "renamed-planner");
+      const next = await tool.execute("approval-same-name-new-id", { action: "send", to: "renamed-planner", message: "Must ask about the replacement" }, t.signal, undefined, harness.ctx);
+      assert.equal(next.details?.declined, true);
+      assert.equal(previews.length, 2, "cache keys must be full session IDs, not names or displayed prefixes");
+      assert.match(previews[1]!, /send a message to "renamed-planner"/);
+      assert.equal(replacementMessages.length, 0);
+    } finally { await replacement.disconnect().catch(() => undefined); }
+  });
+});
+
+test("confirmProactive send/handover cannot follow a same-name/cwd replacement arriving during approval", approvalTestOptions, async (t) => {
+  for (const action of ["send", "handover"]) for (const route of ["name", "cwd"]) {
+    const approval = deferredApproval<boolean>();
+    const previews: string[] = [];
+    await withApprovalHarness({ hasUI: true, ui: { confirm: (_title: string, preview: string) => {
+      previews.push(preview);
+      return previews.length === 1 ? approval.promise : Promise.resolve(false);
+    } } }, async ({ tool, harness, planner, orchestrator, received }) => {
+      await orchestrator.disconnect(); // Planner is the sole peer for cwd-only routing.
+      const originalId = planner.sessionId!;
+      const replacementId = `${originalId.slice(0, 8)}-pending-approval-replacement`;
+      const replacement = new IntercomClient();
+      const replacementMessages: Message[] = [];
+      replacement.on("message", (_from: SessionInfo, message: Message) => replacementMessages.push(message));
+      const args = route === "cwd" ? { cwd: repoDir } : { to: "planner" };
+      const ctx = approvalHandoverContext(harness);
+      const pending = tool.execute(`approval-replaced-pending-${action}-${route}`, { action, ...args, message: "Only for the original target" }, t.signal, undefined, ctx);
+      try {
+        await waitForCondition(() => previews.length === 1, `${action}/${route} approval is pending`);
+        await planner.disconnect();
+        await connectClientWithScope(replacement, process.env.PI_INTERCOM_SCOPE_ID, replacementId, "planner");
+        await waitForNoSessionId(replacement, originalId);
+        approval.resolve(true);
+        const failed = await pending;
+        assert.equal(failed.details?.delivered, false, `${action}/${route} must fail rather than remap the approved ID`);
+        assert.equal(failed.details?.delivery, "failed");
+        await replacement.listSessions(); // Drain its socket before asserting non-delivery.
+        assert.equal(replacementMessages.length, 0, "matching name/cwd and short-ID prefix do not transfer approval");
+        assert.equal(received.length, 0);
+        assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+
+        const next = await tool.execute(`approval-replacement-next-${action}-${route}`, { action, ...args, message: "A separate proposal for the replacement" }, t.signal, undefined, ctx);
+        assert.equal(next.details?.declined, true);
+        assert.equal(previews.length, 2, "addressing the replacement needs its own target-ID approval");
+        assert.match(previews[1]!, /(?:send a message to|hand over to) "planner"/);
+        await replacement.listSessions();
+        assert.equal(replacementMessages.length, 0);
+
+        await connectClientWithScope(planner, process.env.PI_INTERCOM_SCOPE_ID, originalId, "planner");
+        const marker = `original-mailbox-drained-${action}-${route}`;
+        assert.equal((await replacement.send(originalId, { text: marker })).delivered, true);
+        await waitForCondition(() => received.some((message) => message.content.text === marker), "original target receives the mailbox drain marker");
+        assert.deepEqual(received.map((message) => message.content.text), [marker], "the failed proposal must not enter the original mailbox either");
+      } finally {
+        approval.resolve(false);
+        await pending.catch(() => undefined);
+        await replacement.disconnect().catch(() => undefined);
+      }
+    });
+  }
+});
+
+test("confirmProactive cached send/handover fail when the approved peer is replaced in client.send's final roster lookup", approvalTestOptions, async (t) => {
+  for (const action of ["send", "handover"]) for (const route of ["name", "cwd"]) {
+    let calls = 0;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return calls === 1; } } }, async ({ tool, harness, planner, orchestrator, worker, received }) => {
+      await orchestrator.disconnect();
+      const originalId = planner.sessionId!;
+      const replacementId = `${originalId.slice(0, 8)}-final-lookup-replacement`;
+      const replacement = new IntercomClient();
+      const replacementMessages: Message[] = [];
+      replacement.on("message", (_from: SessionInfo, message: Message) => replacementMessages.push(message));
+      const args = route === "cwd" ? { cwd: repoDir } : { to: "planner" };
+      const ctx = approvalHandoverContext(harness);
+      try {
+        const approved = await tool.execute("approval-before-final-replacement", { action: "send", to: originalId, message: "Approve the original target" }, t.signal, undefined, harness.ctx);
+        assert.equal(approved.details?.delivered, true);
+        await waitForCondition(() => received.length === 1, "original target is approved before final-lookup race");
+        const originalSend = IntercomClient.prototype.send;
+        const originalList = IntercomClient.prototype.listSessions;
+        let sendingClient: InstanceType<typeof IntercomClient> | undefined;
+        let armed = true;
+        let replaced = false;
+        IntercomClient.prototype.send = function (to, options) {
+          if (this.sessionId === worker.id && armed) { sendingClient = this; armed = false; }
+          return originalSend.call(this, to, options);
+        };
+        IntercomClient.prototype.listSessions = async function (options) {
+          if (this === sendingClient) {
+            sendingClient = undefined;
+            // Routing and cached authorization have finished. The final live
+            // roster must now miss A, while the broker can remap A's mailbox to B.
+            await planner.disconnect();
+            await connectClientWithScope(replacement, process.env.PI_INTERCOM_SCOPE_ID, replacementId, "planner");
+            await waitForNoSessionId(replacement, originalId);
+            replaced = true;
+          }
+          return originalList.call(this, options);
+        };
+        let failed: CapturedToolResult;
+        try {
+          failed = await tool.execute(`approval-final-replacement-${action}-${route}`, { action, ...args, message: "Only for the previously approved target" }, t.signal, undefined, ctx);
+        } finally {
+          IntercomClient.prototype.send = originalSend;
+          IntercomClient.prototype.listSessions = originalList;
+        }
+        assert.equal(replaced, true, "replacement occurs inside client.send, not during initial target resolution");
+        assert.equal(failed.details?.delivered, false, `${action}/${route} must not fall back to raw mailbox routing`);
+        assert.equal(failed.details?.delivery, "failed");
+        assert.equal(calls, 1, "this request used the original ID's cached permission");
+        await replacement.listSessions();
+        assert.equal(replacementMessages.length, 0);
+        assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 1);
+
+        const next = await tool.execute(`approval-after-final-replacement-${action}-${route}`, { action, ...args, message: "The new peer is not approved" }, t.signal, undefined, ctx);
+        assert.equal(next.details?.declined, true);
+        assert.equal(calls, 2);
+        await replacement.listSessions();
+        assert.equal(replacementMessages.length, 0);
+        await connectClientWithScope(planner, process.env.PI_INTERCOM_SCOPE_ID, originalId, "planner");
+        const marker = `final-lookup-mailbox-drained-${action}-${route}`;
+        assert.equal((await replacement.send(originalId, { text: marker })).delivered, true);
+        await waitForCondition(() => received.some((message) => message.content.text === marker), "reconnected original receives the final-lookup drain marker");
+        assert.deepEqual(received.map((message) => message.content.text), ["Approve the original target", marker]);
+      } finally { await replacement.disconnect().catch(() => undefined); }
+    });
+  }
+});
+
+test("confirmProactive resolved send/handover fail closed when the broker lacks exact-send support", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return true; } } }, async ({ tool, harness, planner, worker, received }) => {
+    const originalSupports = IntercomClient.prototype.supportsFeature;
+    IntercomClient.prototype.supportsFeature = function (feature) {
+      return this.sessionId === worker.id && feature === "exact-send-v1" ? false : originalSupports.call(this, feature);
+    };
+    try {
+      for (const action of ["send", "handover"]) {
+        const failed = await tool.execute(`approval-no-exact-${action}`, { action, to: planner.sessionId!, message: "Never downgrade an approved ID to raw routing" }, t.signal, undefined, approvalHandoverContext(harness));
+        assert.notEqual(failed.details?.delivered, true);
+        assert.ok(failed.details?.error === true || failed.details?.delivered === false, "unsupported exact delivery is an explicit failure");
+      }
+      await planner.listSessions();
+      assert.equal(calls, 1);
+      assert.equal(received.length, 0);
+      assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+    } finally { IntercomClient.prototype.supportsFeature = originalSupports; }
+  });
+});
+
+test("confirmProactive send/ask/handover share permission in every first-action order, including later headless calls", approvalTestOptions, async (t) => {
+  for (const firstAction of ["send", "ask", "handover"]) {
+    let calls = 0;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return calls === 1; } } }, async ({ tool, harness, planner, orchestrator, received }) => {
+      await orchestrator.disconnect();
+      planner.on("message", (from: SessionInfo, message: Message) => {
+        if (message.expectsReply) void planner.send(from.id, { text: "Shared-permission answer", replyTo: message.id }).catch(() => undefined);
+      });
+      const ctx = approvalHandoverContext(harness);
+      const actions = [firstAction, ...["send", "ask", "handover"].filter((action) => action !== firstAction), firstAction];
+      const routes = [{ to: "planner" }, { to: planner.sessionId! }, { to: planner.sessionId!.slice(0, 8) }, { cwd: repoDir }];
+      const execute = async (action: string, index: number, hasUI: boolean, route: Record<string, unknown>) => {
+        const result = await tool.execute(`approval-shared-${firstAction}-${index}`, { action, ...route, message: `Shared action ${index}` }, t.signal, undefined, { ...ctx, hasUI });
+        if (action === "ask") assert.match(result.content[0]!.text, /Shared-permission answer/);
+        else assert.equal(result.details?.delivered, true);
+      };
+      for (const [index, action] of actions.entries()) await execute(action, index, true, routes[index]!);
+      assert.equal(calls, 1, "both enabled flags still produce only the first target approval");
+      for (const [index, action] of ["send", "ask", "handover"].entries()) await execute(action, index + actions.length, false, { to: planner.sessionId! });
+      assert.equal(calls, 1, "a cached local target does not require another UI");
+      await waitForCondition(() => received.length === 7, "every shared-permission call is delivered");
+      assert.equal(new Set(received.map((message) => message.id)).size, 7);
+    }, { confirmSend: true });
+  }
+});
+
+test("confirmProactive concurrent send/handover share one pending approval or rejection without deduplicating messages", approvalTestOptions, async (t) => {
+  for (const approve of [true, false]) for (const leaderAction of ["send", "handover"]) {
+    const approval = deferredApproval<boolean>();
+    let calls = 0;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: () => { calls++; return calls === 1 ? approval.promise : Promise.resolve(true); } } }, async ({ tool, harness, planner, worker, received }) => {
+      const ctx = approvalHandoverContext(harness);
+      const pending: Array<Promise<CapturedToolResult>> = [];
+      try {
+        pending.push(tool.execute("approval-shared-leader", { action: leaderAction, to: "planner", message: "Concurrent shared payload" }, t.signal, undefined, ctx));
+        await waitForCondition(() => calls === 1, "leader approval is pending");
+        const actions = ["send", leaderAction === "send" ? "handover" : "send"];
+        for (const [index, action] of actions.entries()) {
+          const follower = await startApprovalFollower(worker.id, () => tool.execute(`approval-shared-follower-${index}`, {
+            action, to: index === 0 ? planner.sessionId! : planner.sessionId!.slice(0, 8), message: "Concurrent shared payload",
+          }, t.signal, undefined, ctx));
+          pending.push(follower.pending);
+          assert.equal(follower.isPending(), true, "followers wait for the shared decision");
+        }
+        assert.equal(calls, 1);
+        assert.equal(received.length, 0);
+        approval.resolve(approve);
+        for (const result of await Promise.all(pending)) assert.equal(result.details?.[approve ? "delivered" : "declined"], true);
+        assert.equal(calls, 1, "the same rejection must also be shared with current followers");
+        if (approve) {
+          await waitForCondition(() => received.length === 3, "all three approved calls send separate messages");
+          assert.equal(new Set(received.map((message) => message.id)).size, 3);
+          assert.equal(received.filter((message) => message.content.text === "Concurrent shared payload").length, 2);
+        } else {
+          assert.equal(received.length, 0);
+          assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+        }
+        const later = await tool.execute("approval-after-shared-decision", { action: "send", to: "planner", message: "A later independent call" }, t.signal, undefined, harness.ctx);
+        assert.equal(later.details?.delivered, true);
+        assert.equal(calls, approve ? 1 : 2, "approval persists, but rejection does not authorize or permanently block later calls");
+        await waitForCondition(() => received.length === (approve ? 4 : 1), "later independent call arrives once");
+      } finally {
+        approval.resolve(false);
+        await Promise.allSettled(pending);
+      }
+    });
+  }
+});
+
+test("confirmProactive aborting a send/ask/handover follower leaves the leader approval and cache intact", approvalTestOptions, async (t) => {
+  for (const followerAction of ["send", "ask", "handover"]) {
+    const approval = deferredApproval<boolean>();
+    const controller = new AbortController();
+    let calls = 0;
+    let confirmationSignal: AbortSignal | undefined;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: (_title: string, _preview: string, options: { signal: AbortSignal }) => {
+      calls++;
+      confirmationSignal = options.signal;
+      return calls === 1 ? approval.promise : Promise.resolve(false);
+    } } }, async ({ tool, harness, planner, worker, received }) => {
+      const ctx = approvalHandoverContext(harness);
+      planner.on("message", (from: SessionInfo, message: Message) => {
+        if (message.expectsReply) void planner.send(from.id, { text: "Ask slot released", replyTo: message.id }).catch(() => undefined);
+      });
+      const leader = tool.execute("approval-follower-abort-leader", { action: "send", to: "planner", message: "Leader survives" }, t.signal, undefined, harness.ctx);
+      let follower: Promise<CapturedToolResult> | undefined;
+      try {
+        await waitForCondition(() => calls === 1, "leader dialog before follower cancellation");
+        const started = await startApprovalFollower(worker.id, () => tool.execute("approval-aborted-follower", {
+          action: followerAction, to: planner.sessionId!, message: "Cancelled follower must not send",
+        }, AbortSignal.any([controller.signal, t.signal]), undefined, ctx));
+        follower = started.pending;
+        assert.equal(started.isPending(), true);
+        controller.abort();
+        assert.equal((await follower).details?.cancelled, true);
+        assert.equal(confirmationSignal!.aborted, false, "a follower does not own the leader's UI cancellation");
+        assert.equal(calls, 1);
+        assert.equal(received.length, 0);
+        approval.resolve(true);
+        assert.equal((await leader).details?.delivered, true);
+        await waitForCondition(() => received.length === 1, "only the surviving leader is sent");
+        assert.equal(received[0]!.content.text, "Leader survives");
+        const later = await tool.execute("approval-after-follower-abort", { action: followerAction, to: "planner", message: "Later authorized call" }, t.signal, undefined, ctx);
+        if (followerAction === "ask") assert.match(later.content[0]!.text, /Ask slot released/);
+        else assert.equal(later.details?.delivered, true);
+        assert.equal(calls, 1);
+        await waitForCondition(() => received.length === 2, "later call reuses leader approval");
+      } finally {
+        controller.abort(); approval.resolve(false);
+        await Promise.allSettled(follower ? [leader, follower] : [leader]);
+      }
+    });
+  }
+});
+
+test("confirmProactive aborting the send/handover leader cancels current followers and cannot cache a late approval", approvalTestOptions, async (t) => {
+  for (const leaderAction of ["send", "handover"]) {
+    const approval = deferredApproval<boolean>();
+    const controller = new AbortController();
+    let calls = 0;
+    let confirmationSignal: AbortSignal | undefined;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: (_title: string, _preview: string, options: { signal: AbortSignal }) => {
+      if (++calls > 1) return Promise.resolve(false);
+      confirmationSignal = options.signal;
+      return approval.promise; // Simulate a UI which ignores abort and answers late.
+    } } }, async ({ tool, harness, planner, worker, received }) => {
+      const ctx = approvalHandoverContext(harness);
+      const pending: Array<Promise<CapturedToolResult>> = [];
+      try {
+        pending.push(tool.execute("approval-aborted-leader", { action: leaderAction, to: "planner", message: "Cancel the shared request" }, AbortSignal.any([controller.signal, t.signal]), undefined, ctx));
+        await waitForCondition(() => calls === 1, "leader owns the pending dialog");
+        for (const [index, action] of [leaderAction === "send" ? "handover" : "send", "ask"].entries()) {
+          const follower = await startApprovalFollower(worker.id, () => tool.execute(`approval-leader-abort-follower-${index}`, { action, to: planner.sessionId!, message: "Do not send after leader abort" }, t.signal, undefined, ctx));
+          pending.push(follower.pending);
+          assert.equal(follower.isPending(), true);
+        }
+        controller.abort();
+        for (const result of await Promise.all(pending)) assert.equal(result.details?.cancelled, true);
+        assert.equal(confirmationSignal!.aborted, true);
+        assert.equal(calls, 1, "followers must not open replacement dialogs for the cancelled shared request");
+        approval.resolve(true);
+        await new Promise((resolve) => setImmediate(resolve));
+        const later = await tool.execute("approval-after-leader-abort", { action: "send", to: "planner", message: "Still needs a fresh approval" }, t.signal, undefined, harness.ctx);
+        assert.equal(later.details?.declined, true);
+        assert.equal(calls, 2);
+        assert.equal(received.length, 0);
+        assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+      } finally {
+        controller.abort(); approval.resolve(false);
+        await Promise.allSettled(pending);
+      }
+    });
+  }
+});
+
+test("confirmProactive UI cancellation and approval timeouts allow a fresh successful application for the same ID", approvalTestOptions, async (t) => {
+  for (const mode of ["tui", "rpc"] as const) for (const action of ["send", "ask", "handover"]) {
+    for (const outcome of ["user-cancel", "timeout-default", "timeout-error"] as const) {
+      await t.test(`${mode}/${action}/${outcome}`, async (subtest) => {
+        let calls = 0;
+        await withApprovalHarness({ hasUI: true, mode, ui: { confirm: async () => {
+          if (++calls !== 1) return true;
+          if (outcome !== "user-cancel") await new Promise((resolve) => setTimeout(resolve, 10));
+          if (outcome === "timeout-error") throw new Error("Approval UI timed out");
+          return false; // Pi confirm uses false for cancellation and a UI timeout's default value.
+        } } }, async ({ tool, harness, planner, received }) => {
+          planner.on("message", (from: SessionInfo, message: Message) => {
+            if (message.expectsReply) void planner.send(from.id, { text: "Fresh application answered", replyTo: message.id }).catch(() => undefined);
+          });
+          const ctx = approvalHandoverContext(harness);
+          const args = { action, to: planner.sessionId!, message: "An explicit new application" };
+          const first = await tool.execute("approval-reapply-after-ui-result", args, subtest.signal, undefined, ctx);
+          if (outcome === "timeout-error") assert.equal(first.details?.code, "approval_unavailable");
+          else assert.equal(first.details?.declined, true);
+          assert.equal(calls, 1);
+          assert.equal(received.length, 0);
+          assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+          // Even the same tool-call ID must not preserve an unsuccessful decision.
+          for (let index = 0; index < 2; index++) {
+            const next = await tool.execute("approval-reapply-after-ui-result", args, subtest.signal, undefined, ctx);
+            if (action === "ask") assert.match(next.content[0]!.text, /Fresh application answered/);
+            else assert.equal(next.details?.delivered, true);
+          }
+          assert.equal(calls, 2, "only the successful second application is reusable");
+          await waitForCondition(() => received.length === 2, "fresh and cached calls both arrive after unsuccessful approval");
+        });
+      });
+    }
+  }
+});
+
+test("confirmProactive cancelled or timed-out approvals can be retried before the old UI settles", approvalTestOptions, async (t) => {
+  for (const mode of ["tui", "rpc"] as const) for (const action of ["send", "ask", "handover"]) {
+    for (const outcome of ["cancel", "signal-timeout"] as const) {
+      await t.test(`${mode}/${action}/${outcome}`, async (subtest) => {
+        const controller = new AbortController();
+        const firstApproval = deferredApproval<boolean>();
+        const nextApproval = deferredApproval<boolean>();
+        let calls = 0;
+        await withApprovalHarness({ hasUI: true, mode, ui: { confirm: () => {
+          return ++calls === 1 ? firstApproval.promise : nextApproval.promise;
+        } } }, async ({ tool, harness, planner, received }) => {
+          planner.on("message", (from: SessionInfo, message: Message) => {
+            if (message.expectsReply) void planner.send(from.id, { text: "Retry after signal answered", replyTo: message.id }).catch(() => undefined);
+          });
+          const ctx = approvalHandoverContext(harness);
+          const args = { action, to: planner.sessionId!, message: "Retry the same target after interruption" };
+          const first = tool.execute("approval-retry-before-old-ui-settles", args, AbortSignal.any([controller.signal, subtest.signal]), undefined, ctx);
+          let next: Promise<CapturedToolResult> | undefined;
+          try {
+            await waitForCondition(() => calls === 1, "first approval is actually visible before interruption");
+            if (outcome === "signal-timeout") {
+              const deadline = AbortSignal.timeout(10);
+              deadline.addEventListener("abort", () => controller.abort(deadline.reason), { once: true });
+            } else controller.abort();
+            assert.equal((await first).details?.cancelled, true);
+            if (outcome === "signal-timeout") assert.equal(controller.signal.reason.name, "TimeoutError");
+            let nextSettled = false;
+            next = tool.execute("approval-retry-before-old-ui-settles", args, subtest.signal, undefined, ctx);
+            void next.then(() => { nextSettled = true; }, () => { nextSettled = true; });
+            await waitForCondition(() => calls === 2 || nextSettled, "fresh approval opens without the old UI resolving");
+            assert.equal(calls, 2, "the cancelled pending-ID entry must not lock out a fresh application");
+            assert.equal(nextSettled, false);
+            assert.equal(received.length, 0);
+            firstApproval.resolve(true); // A late answer must not approve the new application or send the old one.
+            await new Promise((resolve) => setImmediate(resolve));
+            assert.equal(nextSettled, false);
+            assert.equal(received.length, 0);
+            nextApproval.resolve(true);
+            const retried = await next;
+            if (action === "ask") assert.match(retried.content[0]!.text, /Retry after signal answered/);
+            else assert.equal(retried.details?.delivered, true);
+            const cached = await tool.execute("approval-retry-before-old-ui-settles", args, subtest.signal, undefined, ctx);
+            if (action === "ask") assert.match(cached.content[0]!.text, /Retry after signal answered/);
+            else assert.equal(cached.details?.delivered, true);
+            assert.equal(calls, 2);
+            await waitForCondition(() => received.length === 2, "only the fresh approved application and its cached follow-up arrive");
+          } finally {
+            controller.abort(); firstApproval.resolve(false); nextApproval.resolve(false);
+            await Promise.allSettled(next ? [first, next] : [first]);
+          }
+        });
+      });
+    }
+  }
+});
+
+test("confirmProactive delivered ask cancellation or reply timeout releases the ask slot without revoking target approval", approvalTestOptions, async (t) => {
+  for (const outcome of ["cancel", "reply-timeout"] as const) {
+    await t.test(outcome, async (subtest) => {
+      await withAskTimeoutMs(80, async () => {
+        const controller = new AbortController();
+        let calls = 0;
+        await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return true; } } }, async ({ tool, harness, planner, received }) => {
+          const args = { action: "ask", to: planner.sessionId!, message: "An approved ask whose reply does not arrive" };
+          const first = tool.execute("approval-approved-ask-interrupted", args, AbortSignal.any([controller.signal, subtest.signal]), undefined, harness.ctx);
+          try {
+            await waitForCondition(() => received.length === 1, "first ask has already been delivered with target approval");
+            if (outcome === "cancel") controller.abort();
+            const interrupted = await first;
+            assert.equal(interrupted.details?.error, true);
+            assert.match(interrupted.content[0]!.text, outcome === "cancel" ? /Cancelled/ : /No reply.*within 80ms/);
+            planner.on("message", (from: SessionInfo, message: Message) => {
+              if (message.expectsReply) void planner.send(from.id, { text: "Next ask is allowed", replyTo: message.id }).catch(() => undefined);
+            });
+            const next = await tool.execute("approval-next-after-delivered-ask", args, subtest.signal, undefined, harness.ctx);
+            assert.match(next.content[0]!.text, /Next ask is allowed/);
+            assert.equal(calls, 1, "a reply timeout/cancellation does not erase an already granted target approval");
+            assert.equal(received.length, 2);
+          } finally {
+            controller.abort();
+            await first.catch(() => undefined);
+          }
+        });
+      });
+    });
+  }
+});
+
+test("confirmProactive source session_start and shutdown/start clear approved targets even when source IDs are reused", approvalTestOptions, async (t) => {
+  for (const reset of ["same-id-start", "new-id-start", "shutdown-start"]) {
+    let sourceId = "approval-source-before-reset";
+    let calls = 0;
+    await withApprovalHarness({ sessionId: () => sourceId, hasUI: true, ui: { confirm: async () => { calls++; return calls === 1; } } }, async ({ tool, harness, received }) => {
+      for (let index = 0; index < 2; index++) {
+        const sent = await tool.execute(`approval-before-reset-${index}`, { action: "send", to: "planner", message: `Before source reset ${index}` }, t.signal, undefined, harness.ctx);
+        assert.equal(sent.details?.delivered, true);
+      }
+      assert.equal(calls, 1);
+      await waitForCondition(() => received.length === 2, "cached messages before source reset");
+      if (reset === "shutdown-start") await harness.emitLifecycle("session_shutdown");
+      if (reset === "new-id-start") sourceId = "approval-source-after-reset";
+      await harness.emitLifecycle("session_start");
+      const after = await tool.execute("approval-after-source-reset", { action: "send", to: "planner", message: "A new runtime must ask again" }, t.signal, undefined, harness.ctx);
+      assert.equal(after.details?.declined, true, reset);
+      assert.equal(calls, 2);
+      assert.equal(received.length, 2);
+    });
+  }
+});
+
+test("confirmProactive pool switches clear approved IDs and old reply contexts without restarting the source session", approvalTestOptions, async (t) => {
+  await withIntercomScope(undefined, async () => {
+    let calls = 0;
+    const notifications: string[] = [];
+    await withApprovalHarness({ hasUI: true, ui: {
+      confirm: async () => { calls++; return calls === 1; },
+      notify: (message: string) => { notifications.push(message); },
+    } }, async ({ tool, harness, planner, worker, received }) => {
+      const poolPeer = new IntercomClient();
+      const poolMessages: Message[] = [];
+      poolPeer.on("message", (_from: SessionInfo, message: Message) => poolMessages.push(message));
+      const targetId = planner.sessionId!;
+      try {
+        await connectClientWithScope(poolPeer, "approval-next-pool", targetId, "different-pool-peer");
+        const approved = await tool.execute("approval-before-pool-switch", { action: "send", to: targetId, message: "Approved only in the default pool" }, t.signal, undefined, harness.ctx);
+        assert.equal(approved.details?.delivered, true);
+        await waitForCondition(() => received.length === 1, "default-pool target receives its approved message");
+        const oldAskId = "approval-old-pool-inbound-ask";
+        assert.equal((await planner.send(worker.id, { messageId: oldAskId, text: "A default-pool reply context", expectsReply: true })).delivered, true);
+        await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === oldAskId), "old-pool ask is tracked");
+
+        await harness.commands.get("intercom-pool")!("approval-next-pool", harness.ctx);
+        assert.equal(notifications.at(-1), "Joined intercom pool: approval-next-pool");
+        const moved = await waitForSessionId(poolPeer, worker.id);
+        await waitForNoSessionId(planner, worker.id);
+        assert.equal(moved.startedAt, worker.startedAt, "a pool switch must not restart the whole source session");
+        const pending = await tool.execute("approval-pool-pending", { action: "pending" }, t.signal, undefined, harness.ctx);
+        assert.equal(pending.content[0]?.text, "No unresolved inbound asks.");
+        const staleReply = await tool.execute("approval-old-pool-reply", { action: "reply", replyTo: oldAskId, message: "Never answer an old-pool ask here" }, t.signal, undefined, harness.ctx);
+        assert.equal(staleReply.details?.error, true);
+        assert.match(staleReply.content[0]!.text, /No pending ask/);
+
+        const denied = await tool.execute("approval-new-pool-same-id", { action: "send", to: targetId, message: "Same full ID, different pool and peer" }, t.signal, undefined, harness.ctx);
+        assert.equal(denied.details?.declined, true);
+        assert.equal(calls, 2, "an ID authorized in another pool cannot skip the new-pool dialog");
+        await poolPeer.listSessions();
+        assert.equal(poolMessages.length, 0);
+        assert.equal(received.length, 1);
+      } finally { await poolPeer.disconnect().catch(() => undefined); }
+    });
+  });
+});
+
+test("confirmProactive pool switches abort shared pending approvals and ignore a late true for the same ID in the new pool", approvalTestOptions, async (t) => {
+  await withIntercomScope(undefined, async () => {
+    const oldApproval = deferredApproval<boolean>();
+    const newApproval = deferredApproval<boolean>();
+    const confirmationSignals: AbortSignal[] = [];
+    const notifications: string[] = [];
+    await withApprovalHarness({ hasUI: true, ui: {
+      confirm: (_title: string, _preview: string, options: { signal: AbortSignal }) => {
+        confirmationSignals.push(options.signal);
+        return confirmationSignals.length === 1 ? oldApproval.promise
+          : confirmationSignals.length === 2 ? newApproval.promise : Promise.resolve(false);
+      },
+      notify: (message: string) => { notifications.push(message); },
+    } }, async ({ tool, harness, planner, worker, received }) => {
+      const poolPeer = new IntercomClient();
+      const poolMessages: Message[] = [];
+      poolPeer.on("message", (from: SessionInfo, message: Message) => {
+        poolMessages.push(message);
+        // Settle an accidentally delivered ask so a failure reports without a waiter timeout.
+        if (message.expectsReply) void poolPeer.send(from.id, { text: "Unexpected new-pool ask", replyTo: message.id }).catch(() => undefined);
+      });
+      const requests: Array<Promise<CapturedToolResult>> = [];
+      try {
+        const targetId = planner.sessionId!;
+        await connectClientWithScope(poolPeer, "approval-pending-pool", targetId, "new-pool-same-id-peer");
+        requests.push(tool.execute("approval-old-pool-leader", { action: "send", to: targetId, message: "Only the old pool is proposed" }, t.signal, undefined, harness.ctx));
+        await waitForCondition(() => confirmationSignals.length === 1, "old-pool approval opens");
+        const follower = await startApprovalFollower(worker.id, () => tool.execute("approval-old-pool-ask-follower", { action: "ask", to: targetId, message: "Old-pool ask owns the single-flight slot" }, t.signal, undefined, harness.ctx));
+        requests.push(follower.pending);
+        assert.equal(follower.isPending(), true);
+        assert.equal(confirmationSignals.length, 1, "old-pool send and ask share their pending decision");
+
+        await harness.commands.get("intercom-pool")!("approval-pending-pool", harness.ctx);
+        assert.equal(notifications.at(-1), "Joined intercom pool: approval-pending-pool");
+        assert.equal(confirmationSignals[0]!.aborted, true);
+        assert.equal((await waitForSessionId(poolPeer, worker.id)).startedAt, worker.startedAt);
+        for (const result of await Promise.all(requests)) assert.equal(result.details?.cancelled, true, "old-pool calls settle without waiting for the UI's late answer");
+
+        let currentSettled = false;
+        const current = tool.execute("approval-new-pool-ask", { action: "ask", to: targetId, message: "New pool needs an independent ask approval" }, t.signal, undefined, harness.ctx);
+        requests.push(current);
+        void current.then(() => { currentSettled = true; }, () => { currentSettled = true; });
+        await waitForCondition(() => confirmationSignals.length === 2 || currentSettled, "new-pool ask obtains a fresh approval slot");
+        assert.equal(confirmationSignals.length, 2, "neither the pending-ID map nor intercomAskOwner can leak across pools");
+        assert.equal(currentSettled, false);
+        oldApproval.resolve(true); // The old UI deliberately ignored its aborted signal.
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(currentSettled, false, "late old-pool true must not approve the new-pool follower");
+        assert.equal(confirmationSignals[1]!.aborted, false);
+        newApproval.resolve(false);
+        assert.equal((await current).details?.declined, true);
+
+        const later = await tool.execute("approval-new-pool-after-late-true", { action: "send", to: targetId, message: "Still not approved in this pool" }, t.signal, undefined, harness.ctx);
+        assert.equal(later.details?.declined, true);
+        assert.equal(confirmationSignals.length, 3, "the late true cannot populate the new-pool cache");
+        await poolPeer.listSessions();
+        assert.equal(poolMessages.length, 0);
+        assert.equal(received.length, 0);
+        assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+      } finally {
+        oldApproval.resolve(false); newApproval.resolve(false);
+        await Promise.allSettled(requests);
+        await poolPeer.disconnect().catch(() => undefined);
+      }
+    });
+  });
+});
+
+test("confirmProactive broker reconnection without source lifecycle reset preserves approved target IDs", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return calls === 1; } } }, async ({ tool, harness, planner, worker, received }) => {
+    const originalSend = IntercomClient.prototype.send;
+    let sourceClient: InstanceType<typeof IntercomClient> | undefined;
+    IntercomClient.prototype.send = function (to, options) {
+      if (options.text === "Before synthetic broker disconnect") sourceClient = this;
+      return originalSend.call(this, to, options);
+    };
+    try {
+      assert.equal((await tool.execute("approval-before-reconnect", { action: "send", to: "planner", message: "Before synthetic broker disconnect" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+    } finally { IntercomClient.prototype.send = originalSend; }
+    assert.ok(sourceClient);
+    const socket = (sourceClient as unknown as { socket: { destroy(): void } | null }).socket;
+    assert.ok(socket);
+    const disconnected = once(sourceClient, "disconnected");
+    socket.destroy(); // Only the fixture source socket; never a real session or broker.
+    await disconnected;
+    const status = await tool.execute("approval-reconnect-status", { action: "status" }, t.signal, undefined, harness.ctx);
+    assert.notEqual(status.details?.error, true);
+    const reconnected = await waitForSessionByName(planner, "approval-regression-worker");
+    assert.equal(reconnected.id, worker.id);
+    assert.notEqual(reconnected.endpointEpoch, worker.endpointEpoch, "the fixture really re-registered a new endpoint");
+    const after = await tool.execute("approval-after-reconnect", { action: "send", to: planner.sessionId!, message: "Same approval after reconnect" }, t.signal, undefined, harness.ctx);
+    assert.equal(after.details?.delivered, true);
+    assert.equal(calls, 1);
+    await waitForCondition(() => received.length === 2, "both messages arrive across source reconnection");
+  });
+});
+
+test("confirmProactive permission belongs to the sending runtime rather than a process-global target allowlist", approvalTestOptions, async (t) => {
+  let firstCalls = 0;
+  let secondCalls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { firstCalls++; return true; } } }, async ({ tool, harness, planner, received }) => {
+    assert.equal((await tool.execute("approval-first-runtime", { action: "send", to: "planner", message: "First runtime approved" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+    const second = createExtensionHarness("approval-independent-sender", {
+      sessionId: "approval-independent-source-id", hasUI: true,
+      ui: { confirm: async () => { secondCalls++; return false; } },
+    });
+    try {
+      const { default: extension } = await import("./index.ts");
+      extension(second.pi as never);
+      await second.emitLifecycle("session_start");
+      await waitForSessionByName(planner, "approval-independent-sender");
+      const otherTool = second.tools.find((entry) => entry.name === "intercom")!;
+      const denied = await otherTool.execute("approval-second-runtime", { action: "send", to: planner.sessionId!, message: "Not approved for this sender" }, t.signal, undefined, second.ctx);
+      assert.equal(denied.details?.declined, true);
+      assert.equal(secondCalls, 1);
+      assert.equal((await tool.execute("approval-first-runtime-still-cached", { action: "send", to: "planner", message: "Original runtime stays approved" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+      assert.equal(firstCalls, 1);
+      await waitForCondition(() => received.length === 2, "only the approved sender's calls arrive");
+    } finally { await second.emitLifecycle("session_shutdown"); }
+  });
+});
+
+test("confirmProactive concurrent unresolved names serialize separate per-request approvals instead of sharing by string", approvalTestOptions, async (t) => {
+  const approval = deferredApproval<boolean>();
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: () => { calls++; return calls === 1 ? approval.promise : Promise.resolve(false); } } }, async ({ tool, harness, worker, received }) => {
+    const first = tool.execute("approval-unknown-leader", { action: "send", to: "approval-unknown-peer", message: "Only this unresolved request is approved" }, t.signal, undefined, harness.ctx);
+    let next: Promise<CapturedToolResult> | undefined;
+    try {
+      await waitForCondition(() => calls === 1, "unresolved request dialog appears");
+      const started = await startApprovalFollower(worker.id, () => tool.execute("approval-unknown-next", { action: "handover", to: "approval-unknown-peer", message: "Same unknown spelling is not a shared identity" }, t.signal, undefined, approvalHandoverContext(harness)));
+      next = started.pending;
+      assert.equal(started.isPending(), true);
+      assert.equal(calls, 1, "the UI queue still serializes independent unresolved requests");
+      approval.resolve(true);
+      assert.equal((await first).details?.delivered, false);
+      assert.equal((await next).details?.declined, true);
+      assert.equal(calls, 2, "without a trusted resolved ID, the second request needs its own approval");
+      assert.equal(received.length, 0);
+    } finally {
+      approval.resolve(false);
+      await Promise.allSettled(next ? [first, next] : [first]);
+    }
+  });
+});
+
+test("confirmProactive unresolved and offline names remain per-request approvals and do not preapprove a later live ID", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return true; } } }, async ({ tool, harness, planner, received }) => {
+    const offline = new IntercomClient();
+    const queued: Message[] = [];
+    offline.on("message", (_from: SessionInfo, message: Message) => queued.push(message));
+    try {
+      for (let index = 0; index < 2; index++) {
+        const missing = await tool.execute(`approval-missing-${index}`, { action: "send", to: "approval-unknown-peer", message: "No trusted target ID" }, t.signal, undefined, harness.ctx);
+        assert.equal(missing.details?.delivered, false);
+      }
+      assert.equal(calls, 2, "unknown strings cannot become cache keys");
+      const id = "approval-offline-target-id";
+      await connectClientWithScope(offline, process.env.PI_INTERCOM_SCOPE_ID, id, "approval-offline-peer");
+      await offline.disconnect();
+      await waitForNoSessionId(planner, id);
+      for (let index = 0; index < 2; index++) {
+        const result = await tool.execute(`approval-offline-${index}`, { action: "send", to: "approval-offline-peer", message: `Approved offline mailbox message ${index}` }, t.signal, undefined, harness.ctx);
+        assert.equal(result.details?.delivered, true);
+        assert.equal(result.details?.delivery, "queued");
+      }
+      assert.equal(calls, 4, "an offline mailbox name is approved separately for every request");
+      await connectClientWithScope(offline, process.env.PI_INTERCOM_SCOPE_ID, id, "approval-offline-peer");
+      await waitForCondition(() => queued.length === 2, "only the separately approved mailbox sends are replayed");
+      for (let index = 0; index < 2; index++) {
+        const result = await tool.execute(`approval-now-live-${index}`, { action: "send", to: "approval-offline-peer", message: `Now resolved to a local ID ${index}` }, t.signal, undefined, harness.ctx);
+        assert.equal(result.details?.delivered, true);
+      }
+      assert.equal(calls, 5, "the first live-ID approval is fresh and only then reusable");
+      await waitForCondition(() => queued.length === 4, "each mailbox and live send arrives exactly once");
+      assert.equal(received.length, 0);
+    } finally { await offline.disconnect().catch(() => undefined); }
+  });
+});
+
+test("confirmProactive remote SSH-asserted IDs never reuse local permission or cache a remote name", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return true; } } }, async ({ tool, harness, planner, received }) => {
+    const root = mkdtempSync(path.join(tmpdir(), "intercom-approval-remote-"));
+    const herdr = path.join(root, "herdr");
+    const ssh = path.join(root, "ssh");
+    const deliveries = path.join(root, "deliveries.jsonl");
+    try {
+      const machines = JSON.stringify({ machines: [{ label: "approval-fixture", target: "synthetic-no-network.invalid", enabled: true }] });
+      // Intentionally collide with an approved local session ID: SSH-asserted
+      // metadata must never acquire local target-ID authorization.
+      const agents = JSON.stringify({ agents: [{ agent: "pi", name: "planner", agent_session: { kind: "path", value: `/synthetic/session_${planner.sessionId!}.jsonl` } }] });
+      writeFileSync(herdr, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === "machine") console.log(${JSON.stringify(machines)});\nelse if (args[0] === "--machine") console.log(${JSON.stringify(agents)});\nelse process.exit(64);\n`);
+      writeFileSync(ssh, `#!${process.execPath}\nconst { appendFileSync } = require("node:fs");\nif (process.argv[2] !== "synthetic-no-network.invalid") process.exit(64);\nlet input = "";\nprocess.stdin.setEncoding("utf8").on("data", (chunk) => { input += chunk; });\nprocess.stdin.on("end", () => { appendFileSync(${JSON.stringify(deliveries)}, input); console.log(JSON.stringify({ version: 1, ok: true })); });\n`);
+      chmodSync(herdr, 0o755);
+      chmodSync(ssh, 0o755);
+      assert.equal((await tool.execute("approval-local-before-remote", { action: "send", to: "planner", message: "Local permission only" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+      await withEnv("HERDR_BIN_PATH", herdr, () => withEnv("PATH", `${root}${path.delimiter}${process.env.PATH ?? ""}`, async () => {
+        for (const [index, action] of ["send", "send", "handover"].entries()) {
+          const result = await tool.execute(`approval-remote-${index}`, { action, to: "planner@approval-fixture", message: "Synthetic remote communication" }, t.signal, undefined, approvalHandoverContext(harness));
+          assert.equal(result.details?.delivered, true);
+          assert.equal(result.details?.crossMachine, true);
+          assert.equal(calls, index + 2, "each remote proposal requires a new approval despite name/ID reuse");
+        }
+      }));
+      assert.equal(readFileSync(deliveries, "utf-8").trim().split("\n").length, 3);
+      await waitForCondition(() => received.length === 1, "the local fixture receives only the local message");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+test("confirmProactive cached targets do not bypass legacy reply or human-handover confirmations", approvalTestOptions, async (t) => {
+  const titles: string[] = [];
+  await withApprovalHarness({ hasUI: true, ui: {
+    confirm: async (title: string) => { titles.push(title); return titles.length === 1; },
+    custom: async () => ({ text: "Human-reviewed handover after proactive permission" }),
+    editor: async (_title: string, text: string) => text,
+    notify: () => undefined,
+  } }, async ({ tool, harness, planner, worker, received }) => {
+    const first = await tool.execute("approval-cache-before-reply", { action: "send", to: "planner", message: "Approve proactive traffic" }, t.signal, undefined, harness.ctx);
+    assert.equal(first.details?.delivered, true);
+    for (const action of ["send", "ask"]) {
+      const forged = await tool.execute(`approval-cached-forged-${action}`, { action, to: "planner", replyTo: "fabricated-after-approval", message: "Cached permission cannot validate a forged reply" }, t.signal, undefined, harness.ctx);
+      assert.equal(forged.details?.error, true);
+      assert.match(forged.content[0]!.text, /No pending ask/);
+    }
+    assert.equal(titles.length, 1, "cached permission never bypasses reply validation");
+    const askId = "approval-cached-legacy-reply";
+    await planner.send(worker.id, { messageId: askId, text: "A genuine inbound ask", expectsReply: true });
+    await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === askId), "inbound ask after target approval");
+    const inferred = await tool.execute("approval-cached-inferred", { action: "send", to: "planner", message: "Legacy inferred reply" }, t.signal, undefined, harness.ctx);
+    assert.equal(inferred.content[0]!.text, "Message cancelled by user");
+    const pending = await tool.execute("approval-cached-pending", { action: "pending" }, t.signal, undefined, harness.ctx);
+    assert.match(pending.content[0]!.text, /approval-cached-legacy-reply/);
+    const explicit = await tool.execute("approval-cached-explicit", { action: "send", to: "planner", replyTo: askId, message: "Verified reply keeps the legacy exemption" }, t.signal, undefined, harness.ctx);
+    assert.equal(explicit.details?.delivered, true);
+    assert.deepEqual(titles, ["Approve intercom call", "Send message"]);
+    await harness.commands.get("handover")!("planner", harness.ctx);
+    assert.deepEqual(titles, ["Approve intercom call", "Send message", "Send message"], "human commands still honor confirmSend even for approved targets");
+    const cached = await tool.execute("approval-cache-after-legacy", { action: "send", to: "planner", message: "Proactive permission remains independent" }, t.signal, undefined, harness.ctx);
+    assert.equal(cached.details?.delivered, true);
+    assert.equal(titles.length, 3);
+    await waitForCondition(() => received.length === 3, "only approved proactive calls and the verified reply arrive");
+  }, { confirmSend: true });
+});
+
+test("confirmProactive successful human handovers do not populate proactive permission", approvalTestOptions, async (t) => {
+  for (const confirmSend of [false, true]) {
+    const titles: string[] = [];
+    await withApprovalHarness({ hasUI: true, ui: {
+      confirm: async (title: string) => { titles.push(title); return confirmSend && titles.length === 1; },
+      custom: async () => ({ text: "Human-approved handover only" }),
+      editor: async (_title: string, text: string) => text,
+      notify: () => undefined,
+    } }, async ({ tool, harness, received }) => {
+      await harness.commands.get("handover")!("planner", harness.ctx);
+      await waitForCondition(() => received.length === 1, "human handover arrives under its legacy policy");
+      const proactive = await tool.execute("approval-after-human-handover", { action: "send", to: "planner", message: "This sender has no proactive permission yet" }, t.signal, undefined, harness.ctx);
+      assert.equal(proactive.details?.declined, true);
+      assert.deepEqual(titles, confirmSend ? ["Send message", "Approve intercom call"] : ["Approve intercom call"]);
+      assert.equal(received.length, 1);
+    }, { confirmSend });
+  }
+});
+
+test("confirmSend without confirmProactive continues to confirm every new send", approvalTestOptions, async (t) => {
+  const titles: string[] = [];
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async (title: string) => { titles.push(title); return true; } } }, async ({ tool, harness, received }) => {
+    for (let index = 0; index < 2; index++) {
+      const result = await tool.execute(`approval-legacy-only-${index}`, { action: "send", to: "planner", message: `Legacy send ${index}` }, t.signal, undefined, harness.ctx);
+      assert.equal(result.details?.delivered, true);
+    }
+    assert.deepEqual(titles, ["Send message", "Send message"]);
+    await waitForCondition(() => received.length === 2, "legacy per-message confirmation remains unchanged");
+  }, { confirmProactive: false, confirmSend: true });
+});
+
+test("confirmProactive never accepts trigger, retryOf, or spoofed command metadata as permission", approvalTestOptions, async (t) => {
+  await withApprovalHarness({}, async ({ tool, harness, received }) => {
+    for (const action of ["send", "ask", "handover"]) {
+      for (const trigger of [undefined, "user", "memory", "initiative"]) {
+        for (const retryOf of action === "handover" ? [undefined] : [undefined, "not-a-real-message"]) {
+          const result = await tool.execute("approval-metadata", {
+            action, to: "planner", message: "Proposed communication", trigger, retryOf, fromUserCommand: true,
+          }, t.signal, undefined, harness.ctx);
+          assert.equal(result.details?.requiresApproval, true, JSON.stringify({ action, trigger, retryOf }));
+          assert.equal(result.details?.code, "approval_unavailable");
+          assert.doesNotMatch(result.content[0]!.text, /Pass trigger/);
+        }
+      }
+    }
+    assert.equal(received.length, 0);
+    assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+  });
+});
+
+test("confirmProactive TUI and RPC approve each target ID once even with confirmSend enabled", approvalTestOptions, async (t) => {
+  for (const mode of ["tui", "rpc"] as const) {
+    const approval = deferredApproval<boolean>();
+    const calls: string[] = [];
+    await withApprovalHarness({ hasUI: true, mode, ui: {
+      confirm: (_title: string, preview: string) => {
+        calls.push(preview);
+        return calls.length === 1 ? approval.promise : Promise.resolve(false);
+      },
+    } }, async ({ tool, harness, received }) => {
+      const pending = tool.execute("approval-preview", {
+        action: "send", to: "planner", message: "Review this exact message", trigger: "user",
+        attachments: [{ type: "snippet", name: "note.txt", content: "Attachment content" }],
+      }, t.signal, undefined, harness.ctx);
+      await waitForCondition(() => calls.length === 1, "approval dialog appears");
+      assert.equal(received.length, 0);
+      assert.match(calls[0]!, /planner/);
+      assert.match(calls[0]!, /Review this exact message/);
+      assert.match(calls[0]!, /Attachment content/);
+      approval.resolve(true);
+      assert.equal((await pending).details?.delivered, true);
+      await waitForCondition(() => received.length === 1, "approved proposal arrives once");
+      const next = await tool.execute("approval-next", { action: "send", to: "planner", message: "Same approved session" }, t.signal, undefined, harness.ctx);
+      assert.equal(next.details?.delivered, true);
+      assert.equal(calls.length, 1, "neither flag adds a dialog for an approved target ID");
+      await waitForCondition(() => received.length === 2, "both messages reach the approved target");
+      const other = await tool.execute("approval-other-target", { action: "send", to: "orchestrator", message: "Not preapproved" }, t.signal, undefined, harness.ctx);
+      assert.equal(other.details?.declined, true);
+      assert.equal(calls.length, 2, "another session ID still requires its own approval");
+      assert.equal(received.length, 2);
+    }, { confirmSend: true });
+  }
+});
+
+test("confirmProactive validates replies consistently before considering pane creation", approvalTestOptions, async (t) => {
+  await withApprovalHarness({}, async ({ tool, harness, planner, worker, received }) => {
+    const routing = [{}, { cwd: repoDir }, { cwd: repoDir, openProjectPaneIfMissing: true }];
+    let sequence = 0;
+    for (const route of routing) {
+      for (const explicit of [false, true]) {
+        const askId = `approval-valid-reply-${sequence++}`;
+        assert.equal((await planner.send(worker.id, { messageId: askId, text: "Reply please", expectsReply: true })).delivered, true);
+        await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === askId), "pending ask reaches worker");
+        const result = await tool.execute("approval-reply", {
+          action: "send", to: "planner", message: `Answer ${askId}`, ...route,
+          ...(explicit ? { replyTo: askId } : {}),
+        }, t.signal, undefined, harness.ctx);
+        assert.equal(result.details?.delivered, true);
+        assert.equal(result.details?.replyTo, askId);
+        await waitForCondition(() => received.length === sequence, "verified reply arrives");
+        assert.equal(received.at(-1)!.replyTo, askId);
+      }
+    }
+    const bad = await tool.execute("approval-forged-reply", {
+      action: "send", to: "planner", message: "Not a reply", replyTo: "fabricated-ask",
+      cwd: repoDir, openProjectPaneIfMissing: true,
+    }, t.signal, undefined, harness.ctx);
+    assert.equal(bad.details?.error, true);
+    assert.match(bad.content[0]!.text, /No pending ask/);
+    const askId = "approval-other-sender";
+    await planner.send(worker.id, { messageId: askId, text: "Only reply to me", expectsReply: true });
+    await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === askId), "second pending ask reaches worker");
+    const mismatch = await tool.execute("approval-misdirected-reply", {
+      action: "send", to: "orchestrator", replyTo: askId, message: "Wrong recipient",
+    }, t.signal, undefined, harness.ctx);
+    assert.equal(mismatch.details?.error, true);
+    assert.match(mismatch.content[0]!.text, /not from/);
+    assert.equal(received.length, sequence);
+  });
+});
+
+test("confirmProactive asks with replyTo preview the sender's live renamed identity, not ReplyTracker history", approvalTestOptions, async (t) => {
+  const previews: string[] = [];
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async (_title: string, preview: string) => { previews.push(preview); return true; } } }, async ({ tool, harness, planner, worker, received }) => {
+    const targetId = planner.sessionId!;
+    const askId = "approval-replyto-before-rename";
+    assert.equal((await planner.send(worker.id, { messageId: askId, text: "Ask me a follow-up", expectsReply: true })).delivered, true);
+    await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === askId), "originally named sender's ask is tracked");
+    planner.updatePresence({ name: "live-renamed-ask-sender" });
+    assert.equal((await waitForSessionByName(planner, "live-renamed-ask-sender")).id, targetId);
+    planner.on("message", (from: SessionInfo, message: Message) => {
+      if (message.expectsReply) void planner.send(from.id, { text: "Live renamed sender's answer", replyTo: message.id }).catch(() => undefined);
+    });
+    // The old alias is valid only as evidence of replyTo ownership. Approval
+    // identity and its display name must be refreshed by the full live ID.
+    const result = await tool.execute("approval-replyto-after-rename", { action: "ask", to: "planner", replyTo: askId, message: "A separately approved follow-up" }, t.signal, undefined, harness.ctx);
+    assert.match(result.content[0]!.text, /Live renamed sender's answer/);
+    assert.equal(previews.length, 1);
+    assert.match(previews[0]!, /ask "live-renamed-ask-sender"/);
+    assert.doesNotMatch(previews[0]!, /ask "planner"/);
+    await waitForCondition(() => received.length === 1, "follow-up reaches the same sender ID");
+    assert.equal(received[0]!.replyTo, askId);
+    assert.equal(received[0]!.expectsReply, true);
+  });
+});
+
+test("confirmProactive offline asks with replyTo require approval per request while genuine replies retain mailbox delivery", approvalTestOptions, async (t) => {
+  const previews: string[] = [];
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async (_title: string, preview: string) => { previews.push(preview); return previews.length <= 2; } } }, async ({ tool, harness, planner, orchestrator, worker, received }) => {
+    const targetId = planner.sessionId!;
+    const askId = "approval-offline-replyto-source";
+    assert.equal((await planner.send(worker.id, { messageId: askId, text: "Keep this reply relationship", expectsReply: true })).delivered, true);
+    await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === askId), "ask is tracked before its sender goes offline");
+    await planner.disconnect();
+    await waitForNoSessionId(orchestrator, targetId);
+    for (let index = 0; index < 2; index++) {
+      const failed = await tool.execute(`approval-offline-replyto-${index}`, { action: "ask", to: targetId, replyTo: askId, message: `Offline follow-up ${index}` }, t.signal, undefined, harness.ctx);
+      assert.equal(failed.details?.error, true);
+      assert.equal(failed.details?.delivered, false);
+      assert.equal(failed.details?.delivery, "failed");
+      assert.equal(previews.length, index + 1, "a historical reply sender ID is not a trusted live approval key");
+      assert.ok(previews[index]!.includes(`ask "${targetId}"`), "offline approval displays the requested ID, not a stale name");
+    }
+    const pending = await tool.execute("approval-offline-replyto-pending", { action: "pending" }, t.signal, undefined, harness.ctx);
+    assert.match(pending.content[0]!.text, /approval-offline-replyto-source/);
+    const reply = await tool.execute("approval-offline-genuine-reply", { action: "reply", replyTo: askId, message: "A genuine mailbox answer" }, t.signal, undefined, harness.ctx);
+    assert.equal(reply.details?.delivered, true);
+    assert.equal(reply.details?.delivery, "queued");
+    assert.equal(previews.length, 2, "genuine replies keep their existing proactive exemption");
+    await connectClientWithScope(planner, process.env.PI_INTERCOM_SCOPE_ID, targetId, "planner");
+    await waitForCondition(() => received.length > 0, "only the genuine answer is replayed from the mailbox");
+    assert.deepEqual(received.map((message) => message.content.text), ["A genuine mailbox answer"]);
+    assert.equal(received[0]!.replyTo, askId);
+    const later = await tool.execute("approval-after-offline-replyto", { action: "send", to: targetId, message: "Offline asks never preapproved this live target" }, t.signal, undefined, harness.ctx);
+    assert.equal(later.details?.declined, true);
+    assert.equal(previews.length, 3);
+    assert.match(previews[2]!, /send a message to "planner"/);
+  });
+});
+
+test("confirmProactive real replies retain legacy confirmSend behavior", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return false; } } }, async ({ tool, harness, planner, worker, received }) => {
+    const askId = "approval-legacy-reply";
+    await planner.send(worker.id, { messageId: askId, text: "Reply", expectsReply: true });
+    await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === askId), "legacy reply recorded");
+    const inferred = await tool.execute("approval-inferred-legacy", { action: "send", to: "planner", message: "Answer" }, t.signal, undefined, harness.ctx);
+    assert.equal(inferred.content[0]!.text, "Message cancelled by user");
+    assert.equal(calls, 1);
+    const explicit = await tool.execute("approval-explicit-legacy", { action: "send", to: "planner", message: "Answer", replyTo: askId }, t.signal, undefined, harness.ctx);
+    assert.equal(explicit.details?.delivered, true);
+    assert.equal(calls, 1);
+    await waitForCondition(() => received.length === 1, "explicit reply arrives without extra dialog");
+  }, { confirmSend: true });
+});
+
+test("confirmProactive cancellation and session replacement invalidate pending approvals", approvalTestOptions, async (t) => {
+  for (const action of ["send", "ask"]) {
+    for (const interruption of ["abort", "replace", "shutdown"]) {
+      const approval = deferredApproval<boolean>();
+      const controller = new AbortController();
+      let confirmationSignal: AbortSignal | undefined;
+      let calls = 0;
+      await withApprovalHarness({ hasUI: true, ui: {
+        confirm: (_title: string, _preview: string, options: { signal: AbortSignal }) => {
+          if (++calls > 1) return Promise.resolve(false);
+          confirmationSignal = options.signal;
+          return approval.promise; // Deliberately ignore abort to simulate a late RPC answer.
+        },
+      } }, async ({ tool, harness, received }) => {
+        try {
+          const pending = tool.execute("approval-interrupt", { action, to: "planner", message: "Do not send late" }, AbortSignal.any([controller.signal, t.signal]), undefined, harness.ctx);
+          await waitForCondition(() => Boolean(confirmationSignal), "confirmation is pending");
+          if (interruption === "abort") controller.abort();
+          else await harness.emitLifecycle(interruption === "replace" ? "session_start" : "session_shutdown");
+          const result = await pending; // Must settle without waiting for the fake UI to answer.
+          assert.equal(result.details?.cancelled, true);
+          assert.equal(confirmationSignal!.aborted, true);
+          approval.resolve(true);
+          assert.equal(received.length, 0);
+          assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+          if (interruption === "shutdown") await harness.emitLifecycle("session_start");
+          const next = await tool.execute("approval-after-interrupt", { action: "send", to: "planner", message: "Still needs approval" }, t.signal, undefined, harness.ctx);
+          assert.equal(next.details?.declined, true, "a late answer must not populate the approval cache");
+          assert.equal(calls, 2);
+          assert.equal(received.length, 0);
+        } finally {
+          controller.abort();
+          approval.resolve(false);
+        }
+      });
+    }
+  }
+});
+
+test("confirmProactive reserves ask single-flight while approving and preserves the first waiter", approvalTestOptions, async (t) => {
+  const approval = deferredApproval<boolean>();
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: () => { calls++; return calls === 1 ? approval.promise : Promise.resolve(true); } } }, async ({ tool, harness, planner, worker, received }) => {
+    const first = tool.execute("approval-first-ask", { action: "ask", to: "planner", message: "First ask" }, t.signal, undefined, harness.ctx);
+    try {
+      await waitForCondition(() => calls === 1, "first ask approval");
+      const second = await tool.execute("approval-second-ask", { action: "ask", to: "planner", message: "Second ask", trigger: "user" }, t.signal, undefined, harness.ctx);
+      assert.match(second.content[0]!.text, /Already waiting/);
+      assert.equal(calls, 1);
+      assert.equal(received.length, 0);
+      approval.resolve(true);
+      await waitForCondition(() => received.length === 1, "only first ask is sent");
+      const third = await tool.execute("approval-third-ask", { action: "ask", to: "planner", message: "Still busy" }, t.signal, undefined, harness.ctx);
+      assert.match(third.content[0]!.text, /Already waiting/);
+      await planner.send(worker.id, { text: "First answer", replyTo: received[0]!.id });
+      assert.match((await first).content[0]!.text, /First answer/);
+      planner.on("message", (from: SessionInfo, message: Message) => {
+        if (message.expectsReply) void planner.send(from.id, { text: "Next answer", replyTo: message.id }).catch(() => undefined);
+      });
+      const next = await tool.execute("approval-next-ask", { action: "ask", to: "planner", message: "Next ask" }, t.signal, undefined, harness.ctx);
+      assert.match(next.content[0]!.text, /Next answer/);
+      assert.equal(calls, 1, "later asks reuse the approved target without weakening ask single-flight");
+      assert.equal(received.length, 2);
+    } finally { approval.resolve(false); }
+  });
+});
+
+test("confirmProactive asks cannot reject an unrelated supervisor waiter", approvalTestOptions, async (t) => {
+  await withChildOrchestratorEnv({ orchestratorTarget: "orchestrator", runId: "approval-run", agent: "worker", index: "0" }, async () => {
+    const approval = deferredApproval<boolean>();
+    let calls = 0;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: () => { calls++; return approval.promise; } } }, async ({ tool, harness, orchestrator, worker, received }) => {
+      const pending = tool.execute("approval-intercom-ask", { action: "ask", to: "planner", message: "Proposed ask" }, t.signal, undefined, harness.ctx);
+      try {
+        await waitForCondition(() => calls === 1, "intercom approval pending");
+        const supervisor = harness.tools.find((entry) => entry.name === "contact_supervisor")!;
+        const incoming = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+        const supervisorAsk = supervisor.execute("approval-supervisor", { reason: "need_decision", message: "Supervisor question" }, t.signal, undefined, harness.ctx);
+        const [, message] = await incoming;
+        approval.resolve(true);
+        assert.match((await pending).content[0]!.text, /Already waiting/);
+        assert.equal(received.length, 0);
+        await orchestrator.send(worker.id, { text: "Supervisor answer", replyTo: message.id });
+        assert.match((await supervisorAsk).content[0]!.text, /Supervisor answer/);
+      } finally { approval.resolve(false); }
+    });
+  });
+});
+
+test("confirmProactive leaves read-only tools and disabled-mode communication unchanged", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return false; } } }, async ({ tool, harness }) => {
+    for (const action of ["list", "list-cwd", "status", "pending"]) {
+      const result = await tool.execute("approval-read-only", { action }, t.signal, undefined, harness.ctx);
+      assert.notEqual(result.details?.error, true);
+    }
+    assert.equal(calls, 0);
+  });
+  await withApprovalHarness({}, async ({ tool, harness, planner, received }) => {
+    const result = await tool.execute("approval-disabled-send", { action: "send", to: "planner", message: "Legacy send", trigger: "memory", retryOf: "old-message" }, t.signal, undefined, harness.ctx);
+    assert.equal(result.details?.delivered, true);
+    await waitForCondition(() => received.length === 1, "legacy send arrives");
+    planner.on("message", (from: SessionInfo, message: Message) => {
+      if (message.expectsReply) void planner.send(from.id, { text: "Legacy answer", replyTo: message.id }).catch(() => undefined);
+    });
+    const asked = await tool.execute("approval-disabled-ask", { action: "ask", to: "planner", message: "Legacy ask" }, t.signal, undefined, harness.ctx);
+    assert.match(asked.content[0]!.text, /Legacy answer/);
+  }, { confirmProactive: false });
+});
+
+async function withApprovalProject(run: (fixture: { cwd: string; split: string; started: string; peer: InstanceType<typeof IntercomClient> }) => Promise<void>): Promise<void> {
+  const root = mkdtempSync(path.join(tmpdir(), "intercom-approval-project-"));
+  const cwd = path.join(root, "project");
+  const bin = path.join(root, "herdr");
+  const split = path.join(root, "split");
+  const started = path.join(root, "started");
+  const peer = new IntercomClient();
+  mkdirSync(cwd);
+  writeFileSync(bin, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'herdr 0.7.5'; exit 0; fi
+if [ "$1 $2" = "pane split" ]; then touch ${JSON.stringify(split)}; echo '{"pane_id":"approval-fake-pane"}'; exit 0; fi
+if [ "$1 $2" = "pane run" ]; then touch ${JSON.stringify(started)}; echo '{}'; exit 0; fi
+exit 64
+`);
+  chmodSync(bin, 0o755);
+  try {
+    await withEnv("HERDR_BIN", bin, () => run({ cwd, split, started, peer }));
+  } finally {
+    await peer.disconnect().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("confirmProactive send/ask/handover approve before opening a project pane and bind its session ID", approvalTestOptions, async (t) => {
+  for (const action of ["send", "ask", "handover"]) {
+    for (const outcome of ["headless", "decline", "approve"]) {
+      await withApprovalProject(async ({ cwd, split, started, peer }) => {
+        let calls = 0;
+        const controller = new AbortController();
+        await withApprovalHarness({ hasUI: outcome !== "headless", ui: {
+          confirm: async (_title: string, preview: string) => {
+            calls++;
+            assert.equal(existsSync(split), false, "no pane before approval");
+            assert.equal(existsSync(started), false, "no Pi before approval");
+            assert.match(preview, /open a Herdr pane and start Pi/);
+            assert.ok(preview.includes(cwd));
+            return outcome === "approve";
+          },
+        } }, async ({ tool, harness }) => {
+          const delivered: Message[] = [];
+          peer.on("message", (from: SessionInfo, message: Message) => {
+            delivered.push(message);
+            if (message.expectsReply) void peer.send(from.id, { text: "Project answer", replyTo: message.id }).catch(() => undefined);
+          });
+          const ctx = action === "handover" ? approvalHandoverContext(harness) : harness.ctx;
+          const pending = tool.execute("approval-project", { action, cwd, openProjectPaneIfMissing: true, message: "Project communication" }, AbortSignal.any([controller.signal, t.signal]), undefined, ctx);
+          try {
+            if (outcome === "approve") {
+              await waitForCondition(() => existsSync(started), "approved fake Pi launch");
+              await peer.connect({ name: "approval-project-peer", cwd, herdrPaneId: "approval-fake-pane", model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
+              const result = await pending;
+              assert.notEqual(result.details?.error, true);
+              assert.equal(result.details?.openedProjectPane, true);
+              await waitForCondition(() => delivered.length === 1, "one message to approved project");
+              assert.equal(calls, 1);
+              assert.equal(existsSync(split), true);
+              const aliases = [{ to: peer.sessionId! }, { to: peer.sessionId!.slice(0, 8) }, { to: "approval-project-peer" }, { cwd }];
+              for (const [index, route] of aliases.entries()) {
+                const later = await tool.execute(`approval-project-bound-${index}`, { action: "send", ...route, message: `Bound project message ${index}` }, t.signal, undefined, harness.ctx);
+                assert.equal(later.details?.delivered, true, JSON.stringify(route));
+              }
+              await waitForCondition(() => delivered.length === 5, "the new session ID is approved across all aliases");
+              assert.equal(calls, 1, "creation approval binds only the newly launched session ID");
+            } else {
+              const result = await pending;
+              assert.equal(result.details?.[outcome === "headless" ? "requiresApproval" : "declined"], true);
+              assert.equal(calls, outcome === "headless" ? 0 : 1);
+              assert.equal(existsSync(split), false);
+              assert.equal(existsSync(started), false);
+              assert.equal(delivered.length, 0);
+            }
+          } finally {
+            controller.abort();
+            await pending.catch(() => undefined);
+            await peer.disconnect().catch(() => undefined);
+          }
+        });
+      });
+    }
+  }
+});
+
+test("confirmProactive forged replies cannot create a session or bypass approval", approvalTestOptions, async (t) => {
+  await withApprovalProject(async ({ cwd, split, started }) => {
+    let calls = 0;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return true; } } }, async ({ tool, harness, received }) => {
+      for (const action of ["send", "ask"]) {
+        const result = await tool.execute("approval-bad-project-reply", {
+          action, cwd, openProjectPaneIfMissing: true, replyTo: "fake-reply", message: "Spoofed reply",
+        }, t.signal, undefined, harness.ctx);
+        assert.equal(result.details?.error, true);
+        assert.match(result.content[0]!.text, /No pending ask/);
+      }
+      assert.equal(calls, 0);
+      assert.equal(existsSync(split), false);
+      assert.equal(existsSync(started), false);
+      assert.equal(received.length, 0);
+    });
+  });
+});
+
+function approvalHandoverContext(harness: ReturnType<typeof createExtensionHarness>) {
+  return {
+    ...harness.ctx,
+    sessionManager: {
+      ...harness.ctx.sessionManager,
+      getSessionFile: () => "/sessions/approval-test.jsonl",
+      getBranch: () => [{ type: "message", id: "a", parentId: null, timestamp: "2026-10-28T00:00:00.000Z", message: { role: "user", content: "A test task", timestamp: 0 } }],
+    },
+    modelRegistry: { streamSimple: () => ({ result: async () => ({ stopReason: "stop", content: [{ type: "text", text: "Summary for user review" }] }) }) },
+  };
+}
+
+test("confirmProactive handover previews the generated summary and requires approval", approvalTestOptions, async (t) => {
+  let approve = false;
+  const previews: string[] = [];
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async (_title: string, preview: string) => { previews.push(preview); return approve; } } }, async ({ tool, harness, received }) => {
+    const ctx = approvalHandoverContext(harness);
+    const args = { action: "handover", to: "planner", trigger: "user", message: "Next task" };
+    const declined = await tool.execute("approval-handover-denied", args, t.signal, undefined, ctx);
+    assert.equal(declined.details?.declined, true);
+    assert.equal(received.length, 0);
+    assert.match(previews[0]!, /Summary for user review/);
+    approve = true;
+    const sent = await tool.execute("approval-handover-approved", args, t.signal, undefined, ctx);
+    assert.equal(sent.details?.delivered, true);
+    await waitForCondition(() => received.length === 1, "approved handover arrives");
+    assert.equal(previews.length, 2);
+    assert.match(received[0]!.content.text, /Summary for user review/);
+  });
+});
+
+test("confirmProactive human handover command adds no new approval and preserves confirmSend", approvalTestOptions, async () => {
+  for (const confirmSend of [false, true]) {
+    let calls = 0;
+    await withApprovalHarness({ hasUI: true, ui: {
+      custom: async () => ({ text: "Human-reviewed handover" }),
+      editor: async (_title: string, text: string) => text,
+      confirm: async () => { calls++; return false; },
+      notify: () => undefined,
+    } }, async ({ harness, received }) => {
+      await harness.commands.get("handover")!("planner", harness.ctx);
+      if (!confirmSend) await waitForCondition(() => received.length === 1, "human-command handover arrives");
+      assert.equal(received.length, confirmSend ? 0 : 1);
+      assert.equal(calls, confirmSend ? 1 : 0);
+    }, { confirmSend });
+  }
+});
+
+test("confirmProactive UI failures fail closed and expired reply IDs do not confer permission", approvalTestOptions, async (t) => {
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { throw new Error("UI disconnected"); } } }, async ({ tool, harness, received }) => {
+    for (const action of ["send", "ask"]) {
+      const result = await tool.execute("approval-ui-error", { action, to: "planner", message: "No approval possible" }, t.signal, undefined, harness.ctx);
+      assert.equal(result.details?.code, "approval_unavailable");
+    }
+    assert.equal(received.length, 0);
+  });
+  await withAskTimeoutMs(40, () => withApprovalHarness({}, async ({ tool, harness, planner, worker, received }) => {
+    const askId = "approval-expired-reply";
+    await planner.send(worker.id, { messageId: askId, text: "Expiring question", expectsReply: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const result = await tool.execute("approval-expired", { action: "send", to: "planner", message: "Too late", replyTo: askId }, t.signal, undefined, harness.ctx);
+    assert.equal(result.details?.error, true);
+    assert.match(result.content[0]!.text, /No pending ask/);
+    assert.equal(received.length, 0);
+  }));
+});
+
+test("confirmProactive serializes different-target dialogs and cancellation removes only the queued proposal", approvalTestOptions, async (t) => {
+  const firstApproval = deferredApproval<boolean>();
+  const calls: string[] = [];
+  const controller = new AbortController();
+  await withApprovalHarness({ hasUI: true, ui: { confirm: (_title: string, preview: string) => {
+    calls.push(preview);
+    return calls.length === 1 ? firstApproval.promise : Promise.resolve(true);
+  } } }, async ({ tool, harness, received }) => {
+    const first = tool.execute("approval-dialog-one", { action: "send", to: "planner", message: "First dialog" }, t.signal, undefined, harness.ctx);
+    try {
+      await waitForCondition(() => calls.length === 1, "first dialog visible");
+      const queued = tool.execute("approval-dialog-two", { action: "ask", to: "orchestrator", message: "Cancelled queued ask" }, AbortSignal.any([controller.signal, t.signal]), undefined, harness.ctx);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(calls.length, 1, "second dialog must not replace the first TUI selector");
+      controller.abort();
+      assert.equal((await queued).details?.cancelled, true);
+      assert.equal(calls.length, 1);
+      firstApproval.resolve(false);
+      assert.equal((await first).details?.declined, true);
+      const next = await tool.execute("approval-dialog-next", { action: "send", to: "planner", message: "Next dialog" }, t.signal, undefined, harness.ctx);
+      assert.equal(next.details?.delivered, true);
+      assert.equal(calls.length, 2);
+      await waitForCondition(() => received.length === 1, "only next approved proposal arrives");
+      assert.equal(received[0]!.content.text, "Next dialog");
+    } finally { controller.abort(); firstApproval.resolve(false); }
+  });
+});
+
+test("confirmProactive does not silently retarget an approved unresolved name prefix", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return true; } } }, async ({ tool, harness, received }) => {
+    for (const action of ["send", "ask"]) {
+      const result = await tool.execute("approval-unresolved-prefix", { action, to: "plan", message: "Not approved for planner by its ID" }, t.signal, undefined, harness.ctx);
+      assert.equal(result.details?.delivered, false);
+    }
+    assert.equal(calls, 2);
+    assert.equal(received.length, 0);
+  });
+});
+
+test("confirmProactive ignores unrelated project peers arriving during approval or startup", approvalTestOptions, async (t) => {
+  await withApprovalProject(async ({ cwd, started, peer }) => {
+    const approval = deferredApproval<boolean>();
+    const unrelated = new IntercomClient();
+    const late = new IntercomClient();
+    const wrongMessages: Message[] = [];
+    const rightMessages: Message[] = [];
+    unrelated.on("message", (_from: SessionInfo, message: Message) => wrongMessages.push(message));
+    late.on("message", (_from: SessionInfo, message: Message) => wrongMessages.push(message));
+    peer.on("message", (_from: SessionInfo, message: Message) => rightMessages.push(message));
+    let calls = 0;
+    const controller = new AbortController();
+    await withApprovalHarness({ hasUI: true, ui: { confirm: () => { calls++; return approval.promise; } } }, async ({ tool, harness }) => {
+      const pending = tool.execute("approval-project-identity", { action: "send", to: "new-approved-peer", cwd, openProjectPaneIfMissing: true, message: "Only for the new pane" }, AbortSignal.any([controller.signal, t.signal]), undefined, harness.ctx);
+      try {
+        await waitForCondition(() => calls === 1, "new pane proposal awaiting approval");
+        const registration = { cwd, model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() };
+        // Even matching name/pane metadata cannot make a pre-launch peer the new recipient.
+        await unrelated.connect({ ...registration, name: "new-approved-peer", herdrPaneId: "approval-fake-pane" });
+        approval.resolve(true);
+        await waitForCondition(() => existsSync(started), "new pane starts after approval");
+        await late.connect({ ...registration, name: "unrelated-during-startup", herdrPaneId: "also-not-the-pane" });
+        await peer.connect({ ...registration, name: "new-approved-peer", herdrPaneId: "approval-fake-pane" });
+        const result = await pending;
+        assert.equal(result.details?.delivered, true);
+        await waitForCondition(() => rightMessages.length === 1, "newly created pane receives its proposal");
+        assert.equal(wrongMessages.length, 0);
+      } finally {
+        controller.abort(); approval.resolve(false);
+        await pending.catch(() => undefined);
+        await unrelated.disconnect().catch(() => undefined);
+        await late.disconnect().catch(() => undefined);
+        await peer.disconnect().catch(() => undefined);
+      }
+    });
+  });
+});
+
+test("confirmProactive rechecks cancellation in initial and rebound routing lookups", approvalTestOptions, async (t) => {
+  for (const action of ["send", "ask"]) for (const stage of ["initial", "rebound"]) {
+    const lookup = deferredApproval<void>();
+    const release = deferredApproval<void>();
+    const controller = new AbortController();
+    const originalSend = IntercomClient.prototype.send;
+    const originalList = IntercomClient.prototype.listSessions;
+    let blockedClient: InstanceType<typeof IntercomClient> | undefined;
+    let lookups = 0;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: async () => true } }, async ({ tool, harness, received }) => {
+      IntercomClient.prototype.send = function (to, options) {
+        if (options.text === "Cancel in final lookup") blockedClient = this;
+        return originalSend.call(this, to, options);
+      };
+      IntercomClient.prototype.listSessions = async function (options) {
+        const sessions = await originalList.call(this, options);
+        if (this === blockedClient) {
+          if (stage === "rebound" && lookups++ === 0) {
+            return sessions.map((session) => session.name === "planner" ? { ...session, endpointEpoch: "obsolete-test-epoch" } : session);
+          }
+          blockedClient = undefined;
+          lookup.resolve();
+          await release.promise;
+        }
+        return sessions;
+      };
+      const pending = tool.execute("approval-cancel-final-lookup", { action, to: "planner", message: "Cancel in final lookup" }, AbortSignal.any([controller.signal, t.signal]), undefined, harness.ctx);
+      try {
+        await lookup.promise;
+        controller.abort();
+        release.resolve();
+        const result = await pending;
+        assert.equal(result.details?.error, true);
+        assert.match(result.content[0]!.text, /[Cc]ancelled/);
+        assert.equal(received.length, 0, "no message may be written after cancellation in client.send");
+      } finally {
+        controller.abort(); release.resolve();
+        await pending.catch(() => undefined);
+        IntercomClient.prototype.send = originalSend;
+        IntercomClient.prototype.listSessions = originalList;
+      }
+    });
+  }
+});
+
+test("confirmProactive tool and legacy outbox confirmations share only the UI queue", approvalTestOptions, async (t) => {
+  for (const firstKind of ["tool", "outbox"]) {
+    const firstApproval = deferredApproval<boolean>();
+    const titles: string[] = [];
+    const results: IntercomOutboxResultV1[] = [];
+    await withApprovalHarness({ hasUI: true, ui: { confirm: (title: string) => {
+      titles.push(title);
+      return titles.length === 1 ? firstApproval.promise : Promise.resolve(true);
+    } } }, async ({ tool, harness, received }) => {
+      harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (result) => results.push(result as IntercomOutboxResultV1));
+      const outbox = (suffix = "") => harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+        version: 1, requestId: `approval-outbox-${firstKind}${suffix}`, extensionId: "approval-test", extensionName: "Approval Test",
+        to: "planner", message: "Legacy outbox proposal",
+      });
+      let pending: Promise<CapturedToolResult>;
+      if (firstKind === "tool") {
+        pending = tool.execute("approval-tool-outbox", { action: "send", to: "planner", message: "Tool proposal" }, t.signal, undefined, harness.ctx);
+        await waitForCondition(() => titles.length === 1, "tool dialog visible");
+        outbox();
+      } else {
+        outbox();
+        await waitForCondition(() => titles.length === 1, "outbox dialog visible");
+        pending = tool.execute("approval-outbox-tool", { action: "send", to: "planner", message: "Tool proposal" }, t.signal, undefined, harness.ctx);
+      }
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        assert.equal(titles.length, 1, "no TUI selector can overwrite an outstanding dialog");
+        assert.equal(received.length, 0);
+        firstApproval.resolve(false);
+        const toolResult = await pending;
+        const [outboxResult] = await waitForOutboxResults(results, 1);
+        assert.deepEqual(titles, firstKind === "tool" ? ["Approve intercom call", "Send extension message"] : ["Send extension message", "Approve intercom call"]);
+        assert.equal(outboxResult!.status, firstKind === "tool" ? "sent" : "rejected");
+        assert.equal(toolResult.details?.[firstKind === "tool" ? "declined" : "delivered"], true);
+        await waitForCondition(() => received.length === 1, "only the second, approved message arrives");
+        if (firstKind === "tool") {
+          const afterOutbox = await tool.execute("approval-after-legacy-outbox", { action: "send", to: "planner", message: "Outbox approval is not proactive permission" }, t.signal, undefined, harness.ctx);
+          assert.equal(afterOutbox.details?.delivered, true);
+          assert.equal(titles[2], "Approve intercom call");
+        } else {
+          outbox("-again");
+          assert.equal((await waitForOutboxResults(results, 2))[1]!.status, "sent");
+          assert.equal(titles[2], "Send extension message", "cached tool permission cannot bypass legacy outbox confirmation");
+        }
+        const cached = await tool.execute("approval-outbox-cached-tool", { action: "send", to: "planner", message: "Only proactive calls reuse approval" }, t.signal, undefined, harness.ctx);
+        assert.equal(cached.details?.delivered, true);
+        assert.equal(titles.length, 3);
+        await waitForCondition(() => received.length === 3, "legacy outbox and proactive calls keep independent policies");
+      } finally { firstApproval.resolve(false); }
+    }, { confirmSend: true });
+  }
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return false; } } }, async ({ harness, received }) => {
+    const results: IntercomOutboxResultV1[] = [];
+    harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (result) => results.push(result as IntercomOutboxResultV1));
+    harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+      version: 1, requestId: "approval-outbox-legacy-policy", extensionId: "approval-test", extensionName: "Approval Test",
+      to: "planner", message: "Outbox retains its own policy",
+    });
+    assert.equal((await waitForOutboxResults(results, 1))[0]!.status, "sent");
+    await waitForCondition(() => received.length === 1, "outbox remains notify-only when confirmSend is off");
+    assert.equal(calls, 0);
+  });
+});
+
+test("confirmProactive retries a declined target but reuses approval for later user-labelled sends", { concurrency: false }, async () => {
+  await withIntercomConfig({ confirmProactive: true }, async () => {
+    const { planner, cleanup } = await setupClients();
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const confirmCalls: Array<[string, string]> = [];
+    let approve = false;
+    const harness = createExtensionHarness("proactive-send-worker", {
+      hasUI: true,
+      ui: {
+        confirm: async (title: string, text: string) => {
+          confirmCalls.push([title, text]);
+          return approve;
+        },
+      },
+    });
+    const received: Message[] = [];
+    planner.on("message", (_from: SessionInfo, message: Message) => { received.push(message); });
+
+    try {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      await waitForSessionByName(planner, "proactive-send-worker");
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+      const declined = await intercomTool.execute("proactive-send-1", {
+        action: "send",
+        to: "planner",
+        message: "Undeclared ping",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.equal(declined.details?.declined, true);
+      assert.match(declined.content[0]?.text ?? "", /declined by user/);
+      assert.equal(confirmCalls.length, 1);
+      assert.equal(confirmCalls[0]![0], "Approve intercom call");
+      assert.match(confirmCalls[0]![1], /send a message to "planner"/);
+      assert.match(confirmCalls[0]![1], /proposes to/);
+      assert.match(confirmCalls[0]![1], /Undeclared ping/);
+      assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(received.length, 0);
+
+      approve = true;
+      const memorySent = await intercomTool.execute("proactive-send-2", {
+        action: "send",
+        to: "planner",
+        message: "Memory-driven ping",
+        trigger: "memory",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(memorySent.content[0]?.text ?? "", /Message sent to planner/);
+      assert.equal(confirmCalls.length, 2);
+      assert.match(confirmCalls[1]![1], /informational only.*memory/);
+      await waitForCondition(() => received.some((message) => message.content.text === "Memory-driven ping"), "planner receives the approved memory-driven send");
+
+      const userSent = await intercomTool.execute("proactive-send-3", {
+        action: "send",
+        to: "planner",
+        message: "User-requested ping",
+        trigger: "user",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(userSent.content[0]?.text ?? "", /Message sent to planner/);
+      assert.equal(confirmCalls.length, 2, "the approved session ID no longer prompts on later sends");
+      await waitForCondition(() => received.some((message) => message.content.text === "User-requested ping"), "planner receives the user-declared send");
+      assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 2);
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
+});
+
+test("confirmProactive fails closed without a UI, spares inferred replies, and still gates retries", { concurrency: false }, async () => {
+  await withIntercomConfig({ confirmProactive: true }, async () => {
+    const { planner, cleanup } = await setupClients();
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const harness = createExtensionHarness("proactive-headless-worker");
+
+    try {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const worker = await waitForSessionByName(planner, "proactive-headless-worker");
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+      const blocked = await intercomTool.execute("proactive-headless-1", {
+        action: "send",
+        to: "planner",
+        message: "Self-started ping",
+        trigger: "initiative",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.equal(blocked.details?.error, true);
+      assert.equal(blocked.details?.requiresApproval, true);
+      assert.match(blocked.content[0]?.text ?? "", /needs user approval/);
+      assert.equal(blocked.details?.code, "approval_unavailable");
+      assert.doesNotMatch(blocked.content[0]?.text ?? "", /Pass trigger/);
+
+      const askId = "proactive-gate-ask-1";
+      assert.equal((await planner.send(worker.id, { messageId: askId, text: "Ready?", expectsReply: true })).delivered, true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const replySent = await intercomTool.execute("proactive-headless-2", {
+        action: "send",
+        to: "planner",
+        message: "Answering the ask",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(replySent.content[0]?.text ?? "", /Reply sent to planner \(inferred from pending ask\)/);
+
+      const retried = await intercomTool.execute("proactive-headless-3", {
+        action: "send",
+        to: "planner",
+        message: "User-authored retry",
+        retryOf: askId,
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.equal(retried.details?.requiresApproval, true);
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
+});
+
+test("confirmProactive gates spontaneous asks; a declined ask leaves no stuck reply waiter", { concurrency: false }, async () => {
+  await withIntercomConfig({ confirmProactive: true }, async () => {
+    const { planner, cleanup } = await setupClients();
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const confirmCalls: Array<[string, string]> = [];
+    let approve = false;
+    const harness = createExtensionHarness("proactive-ask-worker", {
+      hasUI: true,
+      ui: {
+        confirm: async (title: string, text: string) => {
+          confirmCalls.push([title, text]);
+          return approve;
+        },
+      },
+    });
+
+    try {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      await waitForSessionByName(planner, "proactive-ask-worker");
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+      const declined = await intercomTool.execute("proactive-ask-1", {
+        action: "ask",
+        to: "planner",
+        message: "Spontaneous question",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(declined.content[0]?.text ?? "", /declined by user/);
+      assert.equal(declined.details?.declined, true);
+      assert.equal(confirmCalls.length, 1);
+      assert.match(confirmCalls[0]![1], /ask "planner"/);
+
+      planner.on("message", (from: SessionInfo, message: Message) => {
+        if (message.expectsReply) {
+          void planner.send(from.id, { text: "Approved answer", replyTo: message.id }).catch(() => undefined);
+        }
+      });
+      approve = true;
+      const answered = await intercomTool.execute("proactive-ask-2", {
+        action: "ask",
+        to: "planner",
+        message: "User-sanctioned question",
+        trigger: "user",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(answered.content[0]?.text ?? "", /Approved answer/);
+      assert.equal(confirmCalls.length, 2);
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
+});
+
 test("contact_supervisor progress_update stays unthreaded despite a pending ask; a later inferred send resolves it", { concurrency: false }, async () => {
   const { orchestrator, cleanup } = await setupClients();
 

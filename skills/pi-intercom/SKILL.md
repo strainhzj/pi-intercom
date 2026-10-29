@@ -63,3 +63,4 @@ When several children wait, run `pending`, then `reply` with `to`. As a child, u
 - `confirmSend` and other settings → [README: Config](../../README.md#config)
 - CLI scripting and other machines → [README: Scripting and Remote Machines](../../README.md#scripting-and-remote-machines)
 - Extension channels for other extensions → [README: Extension channels](../../README.md#extension-channels)
+- Approving agent-initiated calls (`confirmProactive`) → [README: Approving agent-initiated calls](../../README.md#approving-agent-initiated-calls)

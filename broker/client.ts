@@ -30,6 +30,10 @@ interface SendOptions {
   retryOf?: string;
   provenance?: MessageProvenance;
   crossMachine?: CrossMachineProvenance;
+  /** Optional local cancellation/lifecycle guard, checked after routing awaits and before writing. */
+  beforeSend?: () => void;
+  /** Require this exact live session ID; never fall back to a name, prefix, or remapped mailbox. */
+  exactTargetId?: string;
 }
 
 export interface SendResult extends DeliveryDetails {
@@ -678,6 +682,7 @@ export class IntercomClient extends EventEmitter {
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
+        options.beforeSend?.();
         writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}) });
       } catch (error) {
         clearTimeout(timeout);
@@ -686,12 +691,18 @@ export class IntercomClient extends EventEmitter {
       }
     });
 
-    if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) {
+    if (!this.supportsFeature(EXACT_SEND_FEATURE)) {
+      if (options.exactTargetId) throw new Error("Broker does not support exact target delivery required for an approved session");
       return sendOnce();
     }
+    if (options.replyTo && !options.exactTargetId) return sendOnce();
 
     const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
       const sessions = await this.listSessions();
+      if (options.exactTargetId) {
+        const exact = sessions.find((session) => session.id === options.exactTargetId);
+        return exact?.endpointEpoch ? { id: exact.id, epoch: exact.endpointEpoch } : null;
+      }
       const byId = sessions.find((session) => session.id === to);
       const byName = byId ? [] : sessions.filter((session) => session.name?.toLowerCase() === to.toLowerCase());
       const byPrefix = byId || byName.length > 0 ? [] : sessions.filter((session) => session.id.startsWith(to));
@@ -701,7 +712,12 @@ export class IntercomClient extends EventEmitter {
     };
 
     const target = await resolveTarget();
-    if (!target) return sendOnce();
+    if (!target) {
+      options.beforeSend?.();
+      return options.exactTargetId
+        ? { id: messageId, delivered: false, delivery: "failed", code: "E_TARGET_DISCONNECTED", reason: "Approved target session is not currently connected; exact delivery cannot use a mailbox or another session" }
+        : sendOnce();
+    }
     const result = await sendOnce(target.id, target.epoch);
     if (result.code !== "E_TARGET_REBOUND") return result;
     const reboundTarget = await resolveTarget();

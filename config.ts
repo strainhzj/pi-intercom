@@ -51,6 +51,9 @@ export interface IntercomConfig {
   /** Require confirmation before non-reply sends from interactive sessions */
   confirmSend: boolean;
 
+  /** Approve each resolved local target ID once per sender runtime; unresolved/remote proposals remain per-request. */
+  confirmProactive: boolean;
+
   /** Controls whether inbound broker messages may automatically trigger a model turn */
   inboundTrigger: InboundTriggerPolicy;
 
@@ -81,6 +84,7 @@ const defaults: IntercomConfig = {
   brokerCommand: "npx",
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
+  confirmProactive: false,
   inboundTrigger: "always",
   busyDelivery: "steer",
   enabled: true,
@@ -140,6 +144,13 @@ export function loadConfig(): IntercomConfig {
         throw new Error(`"confirmSend" must be a boolean`);
       }
       config.confirmSend = parsedConfig.confirmSend;
+    }
+
+    if (Object.hasOwn(parsedConfig, "confirmProactive")) {
+      if (typeof parsedConfig.confirmProactive !== "boolean") {
+        throw new Error(`"confirmProactive" must be a boolean`);
+      }
+      config.confirmProactive = parsedConfig.confirmProactive;
     }
 
     if (Object.hasOwn(parsedConfig, "enabled")) {

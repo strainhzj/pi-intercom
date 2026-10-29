@@ -75,9 +75,14 @@ interface InboundMessageEntry {
   bodyText: string;
 }
 
+/** Optional explanation shown in the approval dialog. Never an authorization credential. */
+type ProactiveTrigger = "user" | "memory" | "initiative";
+
 interface DeliveryTarget {
   id: string;
   label: string;
+  /** Full ID resolved from the roster, never an unresolved name or caller-supplied prefix. */
+  approvalSessionId?: string;
   projectPane?: ProjectPaneLaunch;
 }
 
@@ -93,11 +98,88 @@ interface DeliveryRequest {
   retryOf?: string;
   /** Handovers are always new messages and are not sent once the signal aborts. */
   handover?: boolean;
+  /** Optional explanation; no value can bypass approval. */
+  trigger?: ProactiveTrigger;
+  /** Set only by a human-invoked command, never exposed in the tool schema. */
+  fromUserCommand?: boolean;
 }
 
 interface IntercomToolResult {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
+}
+
+type LocalDeliveryPlan = DeliveryTarget | { projectCwd: string };
+
+function cancelledIntercomCall(): IntercomToolResult {
+  return {
+    content: [{ type: "text", text: "Intercom call cancelled before delivery." }],
+    details: { error: true, cancelled: true, code: "cancelled" },
+  };
+}
+
+/** Approval may cover one resolved session ID. Caller-supplied metadata never grants permission. */
+async function showOutgoingConfirmation(
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+  proposal: {
+    proactive: boolean;
+    verb: string;
+    target: string;
+    message: string;
+    attachments?: Attachment[];
+    trigger?: ProactiveTrigger;
+    projectCwd?: string;
+    sessionId?: string;
+  },
+): Promise<IntercomToolResult | null> {
+  if (signal.aborted) return cancelledIntercomCall();
+  if (!ctx.hasUI) {
+    return {
+      content: [{ type: "text", text: `Intercom call to "${proposal.target}" needs user approval, but this session has no UI. Ask the user to approve it in an interactive session; no message was sent and no session was opened.` }],
+      details: { error: true, requiresApproval: true, code: "approval_unavailable" },
+    };
+  }
+  const explanation = proposal.trigger ? `\nDeclared reason (informational only): ${proposal.trigger}.` : "";
+  const creation = proposal.projectCwd ? `\nThis will open a Herdr pane and start Pi in ${proposal.projectCwd}.` : "";
+  const scope = !proposal.proactive ? "" : proposal.sessionId
+    ? `\nSession ID: ${proposal.sessionId}. Later send/ask/handover calls to this ID need no further approval until this sender session ends, you reload/restart Pi, or switch intercom pools.`
+    : proposal.projectCwd
+      ? "\nLater send/ask/handover calls to the new pane's session ID need no further approval until this sender session ends, you reload/restart Pi, or switch intercom pools."
+      : "\nNo local session ID is resolved; approval covers only this request.";
+  const preview = proposal.proactive
+    ? `This session proposes to ${proposal.verb} "${proposal.target}".${explanation}${creation}${scope}\n\n${proposal.message}`
+    : `Send to "${proposal.target}":${creation}\n\n${proposal.message}`;
+  let onAbort!: () => void;
+  const aborted = new Promise<false>((resolve) => { onAbort = () => resolve(false); });
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    if (signal.aborted) return cancelledIntercomCall();
+    // Race as well as passing the signal: an RPC client or test UI may settle late.
+    const confirmed = await Promise.race([
+      ctx.ui.confirm(proposal.proactive ? "Approve intercom call" : "Send message",
+        preview + (proposal.attachments?.length ? formatAttachments(proposal.attachments) : ""), { signal }),
+      aborted,
+    ]);
+    if (signal.aborted) return cancelledIntercomCall();
+    if (!confirmed) {
+      return {
+        content: [{ type: "text", text: proposal.proactive
+          ? `Intercom call to "${proposal.target}" declined by user. Do not retry it unprompted.`
+          : "Message cancelled by user" }],
+        details: { declined: true },
+      };
+    }
+    return null;
+  } catch (error) {
+    if (signal.aborted) return cancelledIntercomCall();
+    return {
+      content: [{ type: "text", text: `Intercom approval unavailable: ${getErrorMessage(error)}` }],
+      details: { error: true, requiresApproval: true, code: "approval_unavailable" },
+    };
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /** `rawTo` is the string the caller addressed; pass "" to disable the name-prefix fallback. */
@@ -729,6 +811,61 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let disposed = true;
   let runtimeStarted = false;
   let runtimeGeneration = 0;
+  let outgoingRuntimeAbort = new AbortController();
+  let intercomAskOwner: symbol | null = null;
+  let approvalTail: Promise<void> = Promise.resolve();
+  const approvedOutgoingSessions = new Set<string>();
+  const pendingSessionApprovals = new Map<string, Promise<IntercomToolResult | null>>();
+  // Share only the UI slot with legacy outbox confirmation; its approval policy stays unchanged.
+  async function withApprovalDialog<T>(signal: AbortSignal, display: () => Promise<T>, cancelled: () => T): Promise<T> {
+    const previous = approvalTail;
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => { release = resolve; });
+    approvalTail = previous.then(() => turn);
+    let onAbort!: () => void;
+    const aborted = new Promise<false>((resolve) => { onAbort = () => resolve(false); });
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (signal.aborted) return cancelled();
+      const ready = await Promise.race([previous.then(() => true), aborted]);
+      if (!ready || signal.aborted) return cancelled();
+      return await Promise.race([display(), aborted.then(cancelled)]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      release();
+    }
+  }
+  async function confirmOutgoingRequest(ctx: ExtensionContext, signal: AbortSignal, proposal: Parameters<typeof showOutgoingConfirmation>[2]): Promise<IntercomToolResult | null> {
+    if (signal.aborted) return cancelledIntercomCall();
+    const sessionId = proposal.proactive ? proposal.sessionId : undefined;
+    if (!sessionId) {
+      return withApprovalDialog(signal, () => showOutgoingConfirmation(ctx, signal, proposal), cancelledIntercomCall);
+    }
+    if (approvedOutgoingSessions.has(sessionId)) return null;
+    let pending = pendingSessionApprovals.get(sessionId);
+    if (!pending) {
+      const generation = runtimeGeneration;
+      const decision = withApprovalDialog(signal, () => showOutgoingConfirmation(ctx, signal, proposal), cancelledIntercomCall);
+      pending = decision.then((result) => {
+        if (signal.aborted || !getLiveContext(ctx, generation)) return cancelledIntercomCall();
+        if (!result) approvedOutgoingSessions.add(sessionId);
+        return result;
+      }).finally(() => {
+        if (pendingSessionApprovals.get(sessionId) === pending) pendingSessionApprovals.delete(sessionId);
+      });
+      pendingSessionApprovals.set(sessionId, pending);
+    }
+    // Followers may cancel their own call without dismissing the leader's dialog.
+    let onAbort!: () => void;
+    const aborted = new Promise<IntercomToolResult>((resolve) => { onAbort = () => resolve(cancelledIntercomCall()); });
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (signal.aborted) return cancelledIntercomCall();
+      return await Promise.race([pending, aborted]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
   let agentRunning = false;
   const heldInboundMessages: InboundMessageEntry[] = [];
   let heldInboundTimer: NodeJS.Timeout | null = null;
@@ -813,16 +950,13 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     reject: (error: Error) => void;
   } | null = null;
   function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
-    if (replyWaiter) {
-      return Promise.reject(new Error("Already waiting for a reply"));
-    }
-    if (signal?.aborted) {
-      return Promise.reject(new Error("Cancelled"));
-    }
+    // A failed registration must throw before the caller can send the ask.
+    if (replyWaiter) throw new Error("Already waiting for a reply");
+    if (signal?.aborted) throw new Error("Cancelled");
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         const timeoutDescription = askTimeoutMs % 60000 === 0 ? `${askTimeoutMs / 60000} minutes` : `${askTimeoutMs}ms`;
-        rejectReplyWaiter(new Error(`No reply from "${from}" for message ${replyTo} within ${timeoutDescription}. Last known delivery state: ${getDeliveryState()}. This waiter timeout is not cancellation; the delivered message may still be queued or actionable in the recipient session.`));
+        rejectReplyWaiter(new Error(`No reply from "${from}" for message ${replyTo} within ${timeoutDescription}. Last known delivery state: ${getDeliveryState()}. This waiter timeout is not cancellation; the delivered message may still be queued or actionable in the recipient session.`), replyTo);
       }, askTimeoutMs);
       const cleanup = () => {
         clearTimeout(timeout);
@@ -851,8 +985,23 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       };
     });
   }
-  function rejectReplyWaiter(error: Error): void {
-    replyWaiter?.reject(error);
+  function rejectReplyWaiter(error: Error, expectedMessageId?: string): void {
+    if (expectedMessageId === undefined || replyWaiter?.replyTo === expectedMessageId) {
+      replyWaiter?.reject(error);
+    }
+  }
+  function beginOutgoingOperation(activeClient: IntercomClient, ctx: ExtensionContext, toolSignal?: AbortSignal) {
+    const generation = runtimeGeneration;
+    const signal = AbortSignal.any([outgoingRuntimeAbort.signal, ...(toolSignal ? [toolSignal] : [])]);
+    return {
+      signal,
+      check() {
+        if (signal.aborted) throw new Error("Cancelled");
+        if (!getLiveContext(ctx, generation) || client !== activeClient || !activeClient.isConnected()) {
+          throw new Error("Intercom session changed before delivery");
+        }
+      },
+    };
   }
   function clearReconnectTimer(): void {
     if (!reconnectTimer) {
@@ -1278,10 +1427,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       if (config.confirmSend) {
         let confirmed = false;
         try {
-          confirmed = await liveContext.ui.confirm(
+          const signal = outgoingRuntimeAbort.signal;
+          confirmed = await withApprovalDialog(signal, () => liveContext.ui.confirm(
             "Send extension message",
             `Allow ${request.extensionName} (${request.extensionId}) to send to "${target.label}":\n\n${request.message}`,
-          );
+            { signal },
+          ), () => false);
         } catch (error) {
           settleOutboxRequest(request.requestId, "blocked", { code: "confirmation_unavailable", detail: getErrorMessage(error) });
           return;
@@ -1682,11 +1833,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
-  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
-    const sessions = await activeClient.listSessions();
+  function findSessionTarget(sessions: SessionInfo[], nameOrId: string): SessionInfo | null {
     const byId = sessions.find(s => s.id === nameOrId);
     if (byId) {
-      return byId.id;
+      return byId;
     }
     const lowerName = nameOrId.toLowerCase();
     const byName = sessions.filter(s => s.name?.toLowerCase() === lowerName);
@@ -1696,17 +1846,26 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       throw new Error(`Multiple sessions named "${nameOrId}" are connected. Address one by the id shown in parentheses by "list" (${ids}).`);
     }
     if (byName.length === 1) {
-      return byName[0]!.id;
+      return byName[0]!;
     }
 
     const byIdPrefix = sessions.filter(s => s.id.startsWith(nameOrId));
     if (byIdPrefix.length === 1) {
-      return byIdPrefix[0]!.id;
+      return byIdPrefix[0]!;
     }
     if (byIdPrefix.length > 1) {
       throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
     }
     return null;
+  }
+  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
+    return findSessionTarget(await activeClient.listSessions(), nameOrId)?.id ?? null;
+  }
+  async function resolveDeliveryTarget(activeClient: IntercomClient, nameOrId: string): Promise<DeliveryTarget> {
+    const session = findSessionTarget(await activeClient.listSessions(), nameOrId);
+    return session
+      ? { id: session.id, label: session.name || session.id, approvalSessionId: session.id }
+      : { id: nameOrId, label: nameOrId };
   }
   /**
    * Sends to `firstTarget` and, only when that is the raw unresolved string and the broker answered
@@ -1740,6 +1899,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     signal: AbortSignal | undefined;
     onAttempt: (askId: string) => void;
     deliveryState: () => string;
+    beforeSend?: () => void;
   }): Promise<PrefixSend & { reply: Promise<Message> }> {
     let reply!: Promise<Message>;
     const sent = await sendWithNamePrefixFallback(activeClient, target, async (attemptTo) => {
@@ -1747,13 +1907,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       if (wait.signal?.aborted) {
         throw new Error("Cancelled");
       }
+      wait.beforeSend?.();
       const askId = randomUUID();
       wait.onAttempt(askId);
       reply = waitForReply(attemptTo, askId, wait.signal, () => activeClient.cancelAsk(askId), wait.deliveryState);
       reply.catch(() => undefined);
-      const result = await activeClient.send(attemptTo, { ...payload, messageId: askId, expectsReply: true });
+      const result = await activeClient.send(attemptTo, { ...payload, messageId: askId, expectsReply: true, beforeSend: wait.beforeSend });
       if (!result.delivered) {
-        rejectReplyWaiter(new Error(undeliveredText(attemptTo, result)));
+        rejectReplyWaiter(new Error(undeliveredText(attemptTo, result)), askId);
         await reply.catch(() => undefined);
       }
       return result;
@@ -1807,13 +1968,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     return resolveSessionTarget(activeClient, metadata.orchestratorTarget);
   }
-  async function resolveCwdDeliveryTarget(activeClient: IntercomClient, options: {
+  /** Roster lookup only: opening a pane is a separate, post-approval step. */
+  async function planCwdDeliveryTarget(activeClient: IntercomClient, options: {
     to?: string;
     cwd: string;
     openProjectPaneIfMissing?: boolean;
-    focus?: boolean;
-    signal?: AbortSignal;
-  }): Promise<DeliveryTarget> {
+  }): Promise<LocalDeliveryPlan> {
     const sessions = await activeClient.listSessions();
     const currentSessionId = activeClient.sessionId;
     if (!currentSessionId) {
@@ -1834,22 +1994,46 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       ...(options.to ? { to: options.to } : {}),
     });
     if (existing.kind === "found" && existing.session) {
-      return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
+      return { id: existing.session.id, label: existing.session.name || existing.session.id, approvalSessionId: existing.session.id };
     }
     if (!options.openProjectPaneIfMissing) {
       throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} If the user wants a long-lived peer there in its own Herdr pane, pass openProjectPaneIfMissing: true; otherwise tell the user no session is running there.`);
     }
 
-    const beforeSessionIds = new Set(sessions.map((session) => session.id));
-    const projectPane = await openProjectPane({ cwd: targetCwd, focus: options.focus, signal: options.signal });
-    const session = await waitForProjectSession(activeClient, {
+    return { projectCwd: targetCwd };
+  }
+  async function materializeDeliveryTarget(activeClient: IntercomClient, plan: LocalDeliveryPlan, options: {
+    to?: string;
+    focus?: boolean;
+    operation: ReturnType<typeof beginOutgoingOperation>;
+  }): Promise<DeliveryTarget> {
+    options.operation.check();
+    if ("id" in plan) return plan;
+    // Do not classify sessions arriving during the approval dialog as our new pane.
+    const beforeSessionIds = new Set((await activeClient.listSessions()).map((session) => session.id));
+    options.operation.check();
+    const projectPane = await openProjectPane({ cwd: plan.projectCwd, focus: options.focus, signal: options.operation.signal });
+    options.operation.check();
+    const projectClient = config.confirmProactive ? {
+      async listSessions(listOptions?: { timeoutMs?: number }) {
+        const sessions = await activeClient.listSessions(listOptions);
+        options.operation.check();
+        return sessions.filter((session) => !beforeSessionIds.has(session.id) && session.herdrPaneId === projectPane.paneId);
+      },
+    } : activeClient;
+    const session = await waitForProjectSession(projectClient, {
       projectRoot: projectPane.projectRoot,
-      currentSessionId,
+      currentSessionId: activeClient.sessionId!,
       beforeSessionIds,
       ...(options.to ? { to: options.to } : {}),
-      signal: options.signal,
+      signal: options.operation.signal,
     });
-    return { id: session.id, label: session.name || session.id, projectPane };
+    options.operation.check();
+    return { id: session.id, label: session.name || session.id, approvalSessionId: session.id, projectPane };
+  }
+  function validatePlannedReply(replyTo: string, plan: LocalDeliveryPlan): void {
+    if (!("id" in plan)) throw new Error("A reply must target its existing sender; it cannot open a new session.");
+    replyTracker.resolveReplyTarget({ replyTo, to: plan.id });
   }
   /** Shared by send, handover, and /handover. Never throws; failures are returned as error results. */
   async function deliverMessage(
@@ -1858,8 +2042,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     signal: AbortSignal | undefined,
     request: DeliveryRequest,
   ): Promise<IntercomToolResult> {
-    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf } = request;
+    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, trigger } = request;
+    const operation = beginOutgoingOperation(connectedClient, ctx, signal);
     try {
+      operation.check();
       const crossMachineTarget = Boolean(to?.includes("@"));
       const crossMachineRestriction = explicitCrossMachineSendRestriction({
         to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf,
@@ -1887,32 +2073,16 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         };
       }
       const confirmSend = !replyTo && config.confirmSend && ctx.hasUI;
-      const attachmentText = attachments?.length ? formatAttachments(attachments) : "";
-      if (confirmSend && cwd && openProjectPaneIfMissing) {
-        const confirmed = await ctx.ui.confirm(
-          "Send message",
-          `Send to "${to ?? cwd}":\n\n${message}${attachmentText}`,
-        );
-        if (!confirmed) {
-          return {
-            content: [{ type: "text", text: "Message cancelled by user" }],
-            details: {},
-          };
-        }
-      }
-      if (confirmSend && crossMachineTarget) {
-        const confirmed = await ctx.ui.confirm("Send message", `Send to "${to}":\n\n${message}`);
-        if (!confirmed) {
-          return {
-            content: [{ type: "text", text: "Message cancelled by user" }],
-            details: {},
-          };
-        }
-      }
+      const proposeCommunication = config.confirmProactive && !request.fromUserCommand;
+      const verb = request.handover ? "hand over to" : "send a message to";
       if (crossMachineTarget) {
-        if (request.handover && signal?.aborted) {
-          return { content: [{ type: "text", text: "Handover was cancelled before delivery." }], details: { error: true } };
+        if (proposeCommunication || confirmSend) {
+          const denied = await confirmOutgoingRequest(ctx, operation.signal, {
+            proactive: proposeCommunication, verb, target: to!, message, trigger,
+          });
+          if (denied) return denied;
         }
+        operation.check();
         const identity = buildPresenceIdentity(pi, connectedClient.sessionId ?? ctx.sessionManager.getSessionId());
         try {
           const remote = await sendCrossMachine(to!, message, {
@@ -1921,6 +2091,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
             machine: config.crossMachine.machineName,
           }, {
             remoteCommand: config.crossMachine.remoteCommand,
+            beforeSend: () => operation.check(),
           });
           const remoteTarget = relaySenderName({ name: remote.agent.name, machine: remote.machine.label });
           pi.appendEntry("intercom_sent", {
@@ -1940,18 +2111,26 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         }
       }
-      const target: DeliveryTarget = cwd
-        ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal })
-        : { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
-      const sendTo = target.id;
-      const targetDisplay = target.projectPane ? target.label : to ?? target.label;
-      if (sendTo === connectedClient.sessionId) {
+      // Validate explicit replies before any possible pane creation. With the option off,
+      // preserve the broker's existing reply validation and disconnected-mailbox behavior.
+      const explicitReply = config.confirmProactive && replyTo
+        ? replyTracker.resolveReplyTarget({ to, replyTo }) : null;
+      const plan: LocalDeliveryPlan = cwd
+        ? await planCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing })
+        : explicitReply
+          ? { id: explicitReply.from.id, label: explicitReply.from.name || explicitReply.from.id, approvalSessionId: explicitReply.from.id }
+          : await resolveDeliveryTarget(connectedClient, to!);
+      operation.check();
+      if (explicitReply) validatePlannedReply(replyTo!, plan);
+      const plannedTo = "id" in plan ? plan.id : "";
+      let targetDisplay = "id" in plan ? to ?? plan.label : to ? `${to} in ${plan.projectCwd}` : plan.projectCwd;
+      if (plannedTo === connectedClient.sessionId) {
         return {
           content: [{ type: "text", text: "Cannot message the current session" }],
           details: { error: true },
         };
       }
-      const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
+      const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(plannedTo);
       if (activeReplyMismatch) {
         const senderLabel = activeReplyMismatch.from.name || activeReplyMismatch.from.id;
         return {
@@ -1959,30 +2138,31 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           details: { error: true, replyTo: activeReplyMismatch.message.id },
         };
       }
-      const inferredAsk = replyTo || request.handover ? null : replyTracker.findUniquePendingAskFrom(sendTo);
+      const inferredAsk = replyTo || request.handover || !plannedTo ? null : replyTracker.findUniquePendingAskFrom(plannedTo);
       const effectiveReplyTo = replyTo ?? inferredAsk?.message.id;
-      if (confirmSend && !(cwd && openProjectPaneIfMissing)) {
-        const confirmed = await ctx.ui.confirm(
-          "Send message",
-          `Send to "${targetDisplay}":\n\n${message}${attachmentText}`,
-        );
-        if (!confirmed) {
-          return {
-            content: [{ type: "text", text: "Message cancelled by user" }],
-            details: {},
-          };
-        }
+      const proactive = proposeCommunication && !explicitReply && !inferredAsk;
+      if (proactive || confirmSend) {
+        const denied = await confirmOutgoingRequest(ctx, operation.signal, {
+          proactive, verb, target: "id" in plan ? plan.label : targetDisplay, message, attachments, trigger,
+          ...("projectCwd" in plan ? { projectCwd: plan.projectCwd } : { sessionId: plan.approvalSessionId }),
+        });
+        if (denied) return denied;
       }
-      if (request.handover && signal?.aborted) {
-        return { content: [{ type: "text", text: "Handover was cancelled before delivery." }], details: { error: true } };
-      }
-      const { result, display, resolution, noMatchText } = await sendWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, (attemptTo) => connectedClient.send(attemptTo, {
-        text: message,
-        attachments,
-        replyTo: effectiveReplyTo,
-        supersedes,
-        retryOf,
-      }));
+      operation.check();
+      if (config.confirmProactive && effectiveReplyTo) validatePlannedReply(effectiveReplyTo, plan);
+      const target = await materializeDeliveryTarget(connectedClient, plan, { to, focus, operation });
+      operation.check();
+      if (proactive && target.projectPane) approvedOutgoingSessions.add(target.id);
+      const sendTo = target.id;
+      if (target.projectPane) targetDisplay = target.label;
+      const { result, display, resolution, noMatchText } = await sendWithNamePrefixFallback(connectedClient, { rawTo: cwd || proactive ? "" : to!, firstTarget: sendTo, display: targetDisplay }, (attemptTo) => {
+        operation.check();
+        return connectedClient.send(attemptTo, {
+          text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf,
+          beforeSend: () => operation.check(),
+          exactTargetId: proactive ? target.approvalSessionId : undefined,
+        });
+      });
       if (!result.delivered) {
         if (effectiveReplyTo && isClosedAskReply(result)) {
           dismissIncomingAsk(effectiveReplyTo);
@@ -2021,6 +2201,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         },
       };
     } catch (error) {
+      if (operation.signal.aborted && getErrorMessage(error) === "Cancelled") return cancelledIntercomCall();
       return {
         content: [{ type: "text", text: `Failed to send: ${getErrorMessage(error)}` }],
         details: { error: true },
@@ -2080,6 +2261,11 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     });
   }
   function startSessionRuntime(ctx: ExtensionContext): void {
+    outgoingRuntimeAbort.abort();
+    outgoingRuntimeAbort = new AbortController();
+    intercomAskOwner = null;
+    approvedOutgoingSessions.clear();
+    pendingSessionApprovals.clear();
     const previousClient = client;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session replaced");
     shuttingDown = false;
@@ -2244,6 +2430,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     unsubscribeOutboxRequest();
     shuttingDown = true;
     disposed = true;
+    outgoingRuntimeAbort.abort();
+    intercomAskOwner = null;
+    approvedOutgoingSessions.clear();
+    pendingSessionApprovals.clear();
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session shutting down");
     runtimeGeneration += 1;
     clearStartupConnectTimer();
@@ -2588,7 +2778,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
               : {},
           };
         } catch (error) {
-          rejectReplyWaiter(toError(error));
+          if (questionId) rejectReplyWaiter(toError(error), questionId);
           return {
             content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
             details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
@@ -2652,6 +2842,7 @@ Usage:
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
   intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
+  With confirmProactive on, approve a resolved local target session ID once for this sender session (until reload/restart); later send/ask/handover calls to it need no new approval. Dialogs show the resolved name. Unresolved/remote targets still need per-request approval. Optional 'trigger' explains why ("user", "memory", "initiative"); no value grants permission.
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
   intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
   intercom({ action: "pending" })                                      → List unresolved inbound asks
@@ -2664,7 +2855,7 @@ Usage:
         description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
       }),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a unique name prefix can resolve unless this is a new proposal requiring approval). With approval enabled, use an exact name or ID: unknown names are not silently retargeted after approval. For send/ask/handover with cwd, omit to target the sole live peer there or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
       message: Type.Optional(Type.String({
         description: "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
@@ -2687,6 +2878,9 @@ Usage:
       retryOf: Type.Optional(Type.String({
         description: "Previous message ID this send/ask is a user-authored retry of. Retries always send a new message ID.",
       })),
+      trigger: Type.Optional(StringEnum(["user", "memory", "initiative"] as const, {
+        description: "Optional explanation shown to the user: 'user' (requested), 'memory' (recalled memory), or 'initiative' (own idea). This is not authorization. With confirmProactive enabled, approve each resolved local target session ID once until this sender session ends or Pi reloads/restarts. trigger/retryOf cannot grant approval. Verified replies retain existing behavior; unapproved targets require a UI.",
+      })),
       cwd: Type.Optional(Type.String({
         description: "Working directory filter for 'list-cwd'. For send/ask/handover, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
       })),
@@ -2699,6 +2893,7 @@ Usage:
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const callGeneration = runtimeGeneration;
       let connectedClient: IntercomClient;
       try {
         connectedClient = await ensureConnected("tool");
@@ -2709,9 +2904,11 @@ Usage:
         };
       }
 
+      if (["send", "ask", "handover"].includes(params.action)
+        && (_signal?.aborted || !getLiveContext(ctx, callGeneration))) return cancelledIntercomCall();
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
+      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, trigger } = params;
 
       switch (action) {
         case "list": {
@@ -2836,7 +3033,7 @@ Usage:
             };
           }
           return deliverMessage(connectedClient, ctx, _signal, {
-            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf,
+            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, trigger,
           });
         }
 
@@ -2854,15 +3051,30 @@ Usage:
             };
           }
           let handoverText: string;
+          const operation = beginOutgoingOperation(connectedClient, ctx, _signal);
           try {
-            handoverText = await buildHandoverText(connectedClient, ctx, { goal: message, crossMachine: Boolean(to?.includes("@")) }, _signal);
+            operation.check();
+            if (config.confirmProactive && !ctx.hasUI) {
+              const plan = cwd
+                ? await planCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing })
+                : to!.includes("@") ? null : await resolveDeliveryTarget(connectedClient, to!);
+              operation.check();
+              const denied = await confirmOutgoingRequest(ctx, operation.signal, {
+                proactive: true, verb: "hand over to", target: plan && "id" in plan ? plan.label : to ?? cwd!,
+                message: message ?? "", trigger,
+                ...(plan && "id" in plan ? { sessionId: plan.approvalSessionId } : {}),
+              });
+              if (denied) return denied;
+            }
+            handoverText = await buildHandoverText(connectedClient, ctx, { goal: message, crossMachine: Boolean(to?.includes("@")) }, operation.signal);
+            operation.check();
           } catch (error) {
             return {
               content: [{ type: "text", text: `Handover failed: ${getErrorMessage(error)}` }],
               details: { error: true },
             };
           }
-          return deliverMessage(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true });
+          return deliverMessage(connectedClient, ctx, operation.signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true, trigger });
         }
 
         case "ask": {
@@ -2873,9 +3085,9 @@ Usage:
             };
           }
 
-          if (replyWaiter) {
+          if (replyWaiter || intercomAskOwner) {
             return {
-              content: [{ type: "text", text: "Already waiting for a reply" }],
+              content: [{ type: "text", text: "Already waiting for a reply or approval for another ask" }],
               details: { error: true },
             };
           }
@@ -2893,31 +3105,31 @@ Usage:
               details: { error: true },
             };
           }
+          const askOwner = Symbol("intercom ask");
+          intercomAskOwner = askOwner;
+          const operation = beginOutgoingOperation(connectedClient, ctx, _signal);
           let deliveryState = "created";
           let questionId: string | null = null;
 
           try {
+            operation.check();
             if (openProjectPaneIfMissing && !cwd) {
               return {
                 content: [{ type: "text", text: "openProjectPaneIfMissing requires a target cwd." }],
                 details: { error: true },
               };
             }
-            let target: DeliveryTarget;
-            if (cwd) {
-              target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
-            } else {
-              target = { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
-            }
-            const sendTo = target.id;
-            const targetDisplay = target.projectPane ? target.label : to ?? target.label;
-            if (_signal?.aborted) {
-              return {
-                content: [{ type: "text", text: "Cancelled" }],
-                details: { error: true },
-              };
-            }
-            if (sendTo === connectedClient.sessionId) {
+            const explicitReply = config.confirmProactive && replyTo
+              ? replyTracker.resolveReplyTarget({ to, replyTo }) : null;
+            const plan: LocalDeliveryPlan = cwd
+              ? await planCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing })
+              : explicitReply
+                ? await resolveDeliveryTarget(connectedClient, explicitReply.from.id)
+                : await resolveDeliveryTarget(connectedClient, to!);
+            operation.check();
+            if (explicitReply) validatePlannedReply(replyTo!, plan);
+            let targetDisplay = "id" in plan ? to ?? plan.label : to ? `${to} in ${plan.projectCwd}` : plan.projectCwd;
+            if ("id" in plan && plan.id === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
                 details: { error: true },
@@ -2929,8 +3141,28 @@ Usage:
                 details: { error: true },
               };
             }
-            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, { text: message, attachments, replyTo, supersedes, retryOf }, {
-              signal: _signal,
+            // An ask needs target-session permission even when it carries a reply relationship.
+            if (config.confirmProactive) {
+              const denied = await confirmOutgoingRequest(ctx, operation.signal, {
+                proactive: true, verb: "ask", target: "id" in plan ? plan.label : targetDisplay, message, attachments, trigger,
+                ...("projectCwd" in plan ? { projectCwd: plan.projectCwd } : { sessionId: plan.approvalSessionId }),
+              });
+              if (denied) return denied;
+            }
+            operation.check();
+            if (replyWaiter) throw new Error("Already waiting for a reply");
+            if (explicitReply) validatePlannedReply(replyTo!, plan);
+            const target = await materializeDeliveryTarget(connectedClient, plan, { to, focus, operation });
+            operation.check();
+            if (config.confirmProactive && target.projectPane) approvedOutgoingSessions.add(target.id);
+            if (replyWaiter) throw new Error("Already waiting for a reply");
+            if (target.projectPane) targetDisplay = target.label;
+            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd || config.confirmProactive ? "" : to!, firstTarget: target.id, display: targetDisplay }, {
+              text: message, attachments, replyTo, supersedes, retryOf,
+              exactTargetId: config.confirmProactive ? target.approvalSessionId : undefined,
+            }, {
+              signal: operation.signal,
+              beforeSend: () => operation.check(),
               onAttempt: (askId) => { questionId = askId; },
               deliveryState: () => latestDeliveryState(questionId, deliveryState),
             });
@@ -2970,11 +3202,14 @@ Usage:
               details: target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {},
             };
           } catch (error) {
-            rejectReplyWaiter(toError(error));
+            if (questionId) rejectReplyWaiter(toError(error), questionId);
+            if (!questionId && operation.signal.aborted && getErrorMessage(error) === "Cancelled") return cancelledIntercomCall();
             return {
               content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
               details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
             };
+          } finally {
+            if (intercomAskOwner === askOwner) intercomAskOwner = null;
           }
         }
 
@@ -3230,6 +3465,13 @@ Usage:
       return;
     }
 
+    // IDs are scoped to a pool. Neither approval nor an in-flight dialog may cross this boundary.
+    outgoingRuntimeAbort.abort();
+    outgoingRuntimeAbort = new AbortController();
+    approvedOutgoingSessions.clear();
+    pendingSessionApprovals.clear();
+    intercomAskOwner = null;
+    replyTracker.reset();
     setIntercomScopeId(nextPool);
     const previousClient = client;
     client = null;
@@ -3371,7 +3613,7 @@ Usage:
       notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", generation);
       return;
     }
-    const result = await deliverMessage(handoverClient, ctx, undefined, { ...request, message: edited, handover: true });
+    const result = await deliverMessage(handoverClient, ctx, undefined, { ...request, message: edited, handover: true, fromUserCommand: true });
     const failed = result.details.error === true || result.details.delivered === false;
     notifyIfLive(ctx, failed ? firstTextContent(result) : `Handover: ${firstTextContent(result)}`, failed ? "error" : "info", generation);
   }
