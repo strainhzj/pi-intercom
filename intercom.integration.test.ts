@@ -748,11 +748,12 @@ test("a session refused for a held id stops retrying, tells the user once, and r
   const otherProcess = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
   const holder = new IntercomClient();
   const notifications: string[] = [];
-  const harness = createExtensionHarness("held-worker", {
+  const makeHarness = () => createExtensionHarness("held-worker", {
     sessionId: "held-session",
     hasUI: true,
     ui: { notify: (message: string) => { notifications.push(message); } },
   });
+  let harness = makeHarness();
 
   try {
     await holder.connect({ name: "holder", cwd: "/elsewhere", model: "test-model", pid: otherProcess.pid!, startedAt: Date.now(), lastActivity: Date.now() }, "held-session");
@@ -771,6 +772,10 @@ test("a session refused for a held id stops retrying, tells the user once, and r
     assert.equal((await planner.listSessions()).some((session) => session.id === "held-session"), false);
     assert.equal(notifications.length, 1);
 
+    // A real reload disposes the old factory; reattaching its UI is not a reload.
+    await harness.emitLifecycle("session_shutdown");
+    harness = makeHarness();
+    piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
     await waitForSessionId(planner, "held-session");
   } finally {
@@ -3212,7 +3217,8 @@ test("runtime replacement discards held inbound messages", { concurrency: false 
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, cleanup } = await setupClients();
   let idle = false;
-  const harness = createExtensionHarness("compact-replacement", { hasUI: true, isIdle: () => idle });
+  let sourceId = "compact-runtime-before-replacement";
+  const harness = createExtensionHarness("compact-replacement", { sessionId: () => sourceId, hasUI: true, isIdle: () => idle });
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
@@ -3220,6 +3226,7 @@ test("runtime replacement discards held inbound messages", { concurrency: false 
     assert.equal((await planner.send(target.id, { messageId: "compact-replacement-message", text: "Old runtime" })).delivered, true);
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(harness.sentMessages.length, 0);
+    sourceId = "compact-runtime-after-replacement";
     await harness.emitLifecycle("session_start");
     idle = true;
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -5551,6 +5558,42 @@ async function withApprovalHarness(
 
 const approvalTestOptions = { concurrency: false, timeout: 15_000 };
 
+interface ApprovalStatusDiagnostics {
+  policy: "session-id-v2";
+  enabled: boolean;
+  confirmSend: boolean;
+  runtimeId: string;
+  generation: number;
+  sourceSessionId: string;
+  pool: string | null;
+  approvedSessionIds: string[];
+  pendingSessionIds: string[];
+}
+
+async function readApprovalStatus(tool: CapturedTool, ctx: unknown, signal: AbortSignal): Promise<ApprovalStatusDiagnostics> {
+  const result = await tool.execute("approval-diagnostics", { action: "status" }, signal, undefined, ctx);
+  assert.notEqual(result.details?.error, true);
+  const raw = result.details?.approval;
+  assert.ok(raw && typeof raw === "object" && !Array.isArray(raw), "status exposes details.approval");
+  const approval = raw as ApprovalStatusDiagnostics;
+  assert.equal(approval.policy, "session-id-v2");
+  assert.equal(typeof approval.enabled, "boolean");
+  assert.equal(typeof approval.confirmSend, "boolean");
+  assert.equal(typeof approval.runtimeId, "string");
+  assert.ok(approval.runtimeId.length > 0);
+  assert.ok(Number.isInteger(approval.generation) && approval.generation > 0);
+  assert.equal(typeof approval.sourceSessionId, "string");
+  assert.ok(approval.pool === null || typeof approval.pool === "string");
+  for (const ids of [approval.approvedSessionIds, approval.pendingSessionIds]) {
+    assert.ok(Array.isArray(ids));
+    assert.ok(ids.every((id) => typeof id === "string" && id.length > 0));
+    assert.equal(new Set(ids).size, ids.length, "diagnostic IDs are not duplicated");
+  }
+  const text = result.content.map((part) => part.text).join("\n");
+  for (const label of ["Approval policy", "Approved targets", "Pending approvals"]) assert.ok(text.includes(label), label);
+  return approval;
+}
+
 // Handovers generate a summary before routing. Observe the follower's actual
 // roster lookup, rather than assuming it has joined after merely starting it.
 async function startApprovalFollower(workerId: string, start: () => Promise<CapturedToolResult>) {
@@ -5659,6 +5702,137 @@ test("confirmProactive follows renamed/reconnected session IDs but not a new ses
       assert.equal(replacementMessages.length, 0);
     } finally { await replacement.disconnect().catch(() => undefined); }
   });
+});
+
+test("confirmProactive approved full IDs remain exact and reusable offline despite same-name, ID-prefix, or name impostors", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ hasUI: true, ui: { confirm: async () => { calls++; return calls === 1; } } }, async ({ tool, harness, planner, orchestrator, received }) => {
+    const targetId = planner.sessionId!;
+    const impostor = new IntercomClient();
+    const impostorMessages: Message[] = [];
+    impostor.on("message", (from: SessionInfo, message: Message) => {
+      impostorMessages.push(message);
+      if (message.expectsReply) void impostor.send(from.id, { text: "Unexpected impostor answer", replyTo: message.id }).catch(() => undefined);
+    });
+    try {
+      assert.equal((await tool.execute("approval-before-offline", { action: "send", to: targetId, message: "Approve only the original ID" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+      await waitForCondition(() => received.length === 1, "original target receives its approval send");
+      await planner.disconnect();
+      await waitForNoSessionId(orchestrator, targetId);
+      const attacks = [
+        { label: "offline-alone" },
+        { label: "same-name-and-id-prefix", id: `${targetId}-different-session`, name: "planner" },
+        { label: "full-id-name", id: `${targetId.slice(0, 8)}-name-impostor`, name: targetId },
+        { label: "full-id-name-prefix", id: `${targetId.slice(0, 8)}-name-prefix-impostor`, name: `${targetId}-impostor` },
+      ];
+      for (const attack of attacks) {
+        if (attack.id) await connectClientWithScope(impostor, process.env.PI_INTERCOM_SCOPE_ID, attack.id, attack.name!);
+        try {
+          for (let repeat = 0; repeat < 2; repeat++) for (const action of ["send", "ask", "handover"]) {
+            const result = await tool.execute(`approval-offline-${attack.label}-${action}-${repeat}`, {
+              action, to: targetId, message: `Never remap ${attack.label}/${action}/${repeat}`,
+            }, t.signal, undefined, approvalHandoverContext(harness));
+            assert.equal(result.details?.delivered, false, `${attack.label}/${action} fails exact delivery instead of prompting or queuing`);
+            assert.equal(result.details?.delivery, "failed");
+            assert.equal(calls, 1, "a cached full ID remains authorized while offline");
+          }
+          if (attack.id) await impostor.listSessions();
+          assert.equal(impostorMessages.length, 0, "a live name or ID prefix cannot capture the approved full ID");
+          const status = await readApprovalStatus(tool, harness.ctx, t.signal);
+          assert.deepEqual(status.approvedSessionIds, [targetId]);
+          assert.deepEqual(status.pendingSessionIds, []);
+        } finally {
+          await impostor.disconnect().catch(() => undefined);
+          if (attack.id) await waitForNoSessionId(orchestrator, attack.id);
+        }
+      }
+      for (const alias of ["planner", targetId.slice(0, 8)]) for (let repeat = 0; repeat < 2; repeat++) {
+        const denied = await tool.execute(`approval-offline-alias-${alias}-${repeat}`, {
+          action: "send", to: alias, message: "An offline name or short prefix is not a cached full ID",
+        }, t.signal, undefined, harness.ctx);
+        assert.equal(denied.details?.declined, true);
+      }
+      assert.equal(calls, 5, "only literal full IDs already in the cache survive offline; names and prefixes remain per-request");
+      assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 1);
+      await connectClientWithScope(planner, process.env.PI_INTERCOM_SCOPE_ID, targetId, "planner");
+      const marker = "approved-offline-mailbox-drained";
+      assert.equal((await orchestrator.send(targetId, { text: marker })).delivered, true);
+      await waitForCondition(() => received.some((message) => message.content.text === marker), "original target drains its mailbox on reconnect");
+      assert.deepEqual(received.map((message) => message.content.text), ["Approve only the original ID", marker], "offline approved requests never entered a mailbox");
+      const after = await tool.execute("approval-after-offline", { action: "send", to: targetId, message: "Same approval after reconnect" }, t.signal, undefined, harness.ctx);
+      assert.equal(after.details?.delivered, true);
+      assert.equal(calls, 5, "separately declined offline aliases do not revoke the approved full ID");
+      await waitForCondition(() => received.length === 3, "reconnected full ID still uses its original approval");
+    } finally { await impostor.disconnect().catch(() => undefined); }
+  });
+});
+
+test("confirmProactive pending full IDs retain one shared offline decision even when another session claims the ID as its name", approvalTestOptions, async (t) => {
+  for (const approve of [true, false]) {
+    const approval = deferredApproval<boolean>();
+    const controller = new AbortController();
+    let calls = 0;
+    await withApprovalHarness({ hasUI: true, ui: { confirm: () => { calls++; return calls === 1 ? approval.promise : Promise.resolve(true); } } }, async ({ tool, harness, planner, orchestrator, worker, received }) => {
+      const targetId = planner.sessionId!;
+      const impostor = new IntercomClient();
+      const impostorMessages: Message[] = [];
+      impostor.on("message", (from: SessionInfo, message: Message) => {
+        impostorMessages.push(message);
+        if (message.expectsReply) void impostor.send(from.id, { text: "Unexpected pending-ID answer", replyTo: message.id }).catch(() => undefined);
+      });
+      const requests: Array<Promise<CapturedToolResult>> = [];
+      const signal = AbortSignal.any([controller.signal, t.signal]);
+      try {
+        requests.push(tool.execute("approval-offline-pending-leader", { action: "send", to: targetId, message: "Original pending proposal" }, signal, undefined, harness.ctx));
+        await waitForCondition(() => calls === 1, "original full-ID approval is pending");
+        await planner.disconnect();
+        await waitForNoSessionId(orchestrator, targetId);
+        await connectClientWithScope(impostor, process.env.PI_INTERCOM_SCOPE_ID, `${targetId}-pending-impostor`, targetId);
+        for (const action of ["send", "ask", "handover"]) {
+          const follower = await startApprovalFollower(worker.id, () => tool.execute(`approval-offline-pending-${action}`, {
+            action, to: targetId, message: `Offline ${action} shares the original decision`,
+          }, signal, undefined, approvalHandoverContext(harness)));
+          requests.push(follower.pending);
+          assert.equal(follower.isPending(), true);
+        }
+        const pending = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.deepEqual(pending.approvedSessionIds, []);
+        assert.deepEqual(pending.pendingSessionIds, [targetId], "only the actual pending full ID is tracked, not the impostor's ID");
+        assert.equal(calls, 1);
+        approval.resolve(approve);
+        for (const result of await Promise.all(requests)) {
+          if (approve) {
+            assert.equal(result.details?.delivered, false);
+            assert.equal(result.details?.delivery, "failed");
+          } else assert.equal(result.details?.declined, true);
+        }
+        assert.equal(calls, 1, "followers share approval and rejection without a second dialog");
+        await impostor.listSessions();
+        assert.equal(impostorMessages.length, 0);
+        assert.equal(received.length, 0);
+        assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
+        const settled = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.deepEqual(settled.pendingSessionIds, []);
+        assert.deepEqual(settled.approvedSessionIds, approve ? [targetId] : []);
+
+        await connectClientWithScope(planner, process.env.PI_INTERCOM_SCOPE_ID, targetId, "planner");
+        const marker = `pending-offline-mailbox-drained-${approve}`;
+        assert.equal((await orchestrator.send(targetId, { text: marker })).delivered, true);
+        await waitForCondition(() => received.some((message) => message.content.text === marker), "original pending target reconnects without queued proposals");
+        assert.deepEqual(received.map((message) => message.content.text), [marker]);
+        const next = await tool.execute("approval-after-offline-pending", { action: "send", to: targetId, message: "A later independent request" }, t.signal, undefined, harness.ctx);
+        assert.equal(next.details?.delivered, true);
+        assert.equal(calls, approve ? 1 : 2, "only a positive shared decision persists after the target reconnects");
+        await waitForCondition(() => received.length === 2, "later request reaches only the original ID");
+        await impostor.listSessions();
+        assert.equal(impostorMessages.length, 0);
+      } finally {
+        controller.abort(); approval.resolve(false);
+        await Promise.allSettled(requests);
+        await impostor.disconnect().catch(() => undefined);
+      }
+    });
+  }
 });
 
 test("confirmProactive send/handover cannot follow a same-name/cwd replacement arriving during approval", approvalTestOptions, async (t) => {
@@ -6080,8 +6254,185 @@ test("confirmProactive delivered ask cancellation or reply timeout releases the 
   }
 });
 
-test("confirmProactive source session_start and shutdown/start clear approved targets even when source IDs are reused", approvalTestOptions, async (t) => {
-  for (const reset of ["same-id-start", "new-id-start", "shutdown-start"]) {
+test("confirmProactive same-source UI rebind does not request a second approval", approvalTestOptions, async (t) => {
+  let calls = 0;
+  await withApprovalHarness({ sessionId: "same-source-rebind-regression", hasUI: true, ui: { confirm: async () => { calls++; return calls === 1; } } }, async ({ tool, harness, planner, received }) => {
+    const args = { action: "send", to: planner.sessionId!, message: "Same target before and after UI attachment" };
+    assert.equal((await tool.execute("approval-before-simple-rebind", args, t.signal, undefined, harness.ctx)).details?.delivered, true);
+    const reboundContext = { ...harness.ctx, sessionManager: { ...harness.ctx.sessionManager } };
+    await harness.emitLifecycle("session_start", {}, reboundContext);
+    const after = await tool.execute("approval-after-simple-rebind", args, t.signal, undefined, reboundContext);
+    assert.equal(after.details?.delivered, true, "the same source and target IDs must retain their accepted approval");
+    assert.equal(calls, 1, "SDK UI rebind is not a new sending session");
+    await waitForCondition(() => received.length === 2, "both approved messages arrive across UI rebind");
+  });
+});
+
+test("confirmProactive same-ID SDK UI rebind preserves send/ask/handover approval and refreshes the runtime context without replacing its endpoint", approvalTestOptions, async (t) => {
+  let originalCalls = 0;
+  const reboundTitles: string[] = [];
+  await withApprovalHarness({ sessionId: "approval-ui-rebind-source", hasUI: true, ui: { confirm: async () => { originalCalls++; return originalCalls === 1; } } }, async ({ tool, harness, planner, worker, received }) => {
+    planner.on("message", (from: SessionInfo, message: Message) => {
+      if (message.expectsReply) void planner.send(from.id, { text: "Answer after UI rebind", replyTo: message.id }).catch(() => undefined);
+    });
+    const initial = await readApprovalStatus(tool, harness.ctx, t.signal);
+    assert.equal(initial.enabled, true);
+    assert.equal(initial.confirmSend, true);
+    assert.equal(initial.sourceSessionId, "approval-ui-rebind-source");
+    assert.deepEqual(initial.approvedSessionIds, []);
+    assert.deepEqual(initial.pendingSessionIds, []);
+    assert.equal((await tool.execute("approval-ui-before-rebind", { action: "send", to: planner.sessionId!, message: "Approve before SDK UI attachment" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+    const before = await readApprovalStatus(tool, harness.ctx, t.signal);
+    assert.deepEqual(before.approvedSessionIds, [planner.sessionId!]);
+    const ctxB = {
+      ...approvalHandoverContext(harness),
+      model: { id: "rebound-model" },
+      sessionManager: { ...approvalHandoverContext(harness).sessionManager },
+      ui: { confirm: async (title: string) => { reboundTitles.push(title); return false; } },
+    };
+    await harness.emitLifecycle("session_start", {}, ctxB);
+    const rebound = await readApprovalStatus(tool, ctxB, t.signal);
+    assert.equal(rebound.runtimeId, before.runtimeId);
+    assert.equal(rebound.generation, before.generation);
+    assert.equal(rebound.sourceSessionId, before.sourceSessionId);
+    assert.deepEqual(rebound.approvedSessionIds, before.approvedSessionIds);
+    assert.deepEqual(rebound.pendingSessionIds, []);
+    for (const [index, action] of ["send", "ask", "handover"].entries()) {
+      const result = await tool.execute(`approval-ui-after-rebind-${action}`, {
+        action, to: planner.sessionId!, message: `Cached action after UI rebind ${index}`,
+      }, t.signal, undefined, ctxB);
+      if (action === "ask") assert.match(result.content[0]!.text, /Answer after UI rebind/);
+      else assert.equal(result.details?.delivered, true);
+    }
+    await waitForCondition(() => received.length === 4, "every proactive call survives the same-ID rebind exactly once");
+    assert.equal(originalCalls, 1);
+    assert.deepEqual(reboundTitles, [], "the rebound UI is not asked to reapprove the same target");
+    const endpoint = await waitForSessionId(planner, worker.id);
+    assert.ok(worker.endpointEpoch);
+    assert.equal(endpoint.endpointEpoch, worker.endpointEpoch, "SDK UI attachment must not recreate the broker endpoint");
+    assert.equal(endpoint.startedAt, worker.startedAt);
+
+    // Outbox requests use runtimeContext rather than the tool call's ctx. Its
+    // separate legacy policy must now consult the newly attached UI, not ctxA.
+    const outboxResults: IntercomOutboxResultV1[] = [];
+    harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (result) => outboxResults.push(result as IntercomOutboxResultV1));
+    harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+      version: 1, requestId: "approval-rebound-runtime-context", extensionId: "approval-test", extensionName: "Approval Test",
+      to: "planner", message: "Legacy request must use the rebound UI",
+    });
+    assert.equal((await waitForOutboxResults(outboxResults, 1))[0]!.status, "rejected");
+    assert.deepEqual(reboundTitles, ["Send extension message"]);
+    assert.equal(originalCalls, 1, "the old UI context is no longer used for runtime-owned work");
+    assert.equal(received.length, 4);
+  }, { confirmSend: true });
+});
+
+test("confirmProactive same-ID SDK UI rebind preserves pending shared decisions, ask ownership, and delivered reply waiters", approvalTestOptions, async (t) => {
+  for (const leaderAction of ["send", "ask"]) {
+    const approval = deferredApproval<boolean>();
+    const controller = new AbortController();
+    let calls = 0;
+    let reboundCalls = 0;
+    let confirmationSignal: AbortSignal | undefined;
+    await withApprovalHarness({ sessionId: "approval-pending-ui-rebind-source", hasUI: true, ui: {
+      confirm: (_title: string, _preview: string, options: { signal: AbortSignal }) => {
+        calls++;
+        confirmationSignal = options.signal;
+        return calls === 1 ? approval.promise : Promise.resolve(false);
+      },
+    } }, async ({ tool, harness, planner, worker, received }) => {
+      const targetId = planner.sessionId!;
+      const signal = AbortSignal.any([controller.signal, t.signal]);
+      const requests: Array<{ action: string; pending: Promise<CapturedToolResult> }> = [];
+      let askSettled = false;
+      const track = (action: string, pending: Promise<CapturedToolResult>) => {
+        requests.push({ action, pending });
+        if (action === "ask") void pending.then(() => { askSettled = true; }, () => { askSettled = true; });
+      };
+      try {
+        track(leaderAction, tool.execute(`approval-rebind-${leaderAction}-leader`, { action: leaderAction, to: targetId, message: "Shared leader before UI rebind" }, signal, undefined, harness.ctx));
+        await waitForCondition(() => calls === 1, "shared approval opens before SDK UI rebind");
+        for (const action of [leaderAction === "ask" ? "send" : "ask", "handover"]) {
+          const follower = await startApprovalFollower(worker.id, () => tool.execute(`approval-rebind-${action}-follower`, {
+            action, to: targetId, message: "Shared follower before UI rebind",
+          }, signal, undefined, approvalHandoverContext(harness)));
+          track(action, follower.pending);
+          assert.equal(follower.isPending(), true);
+        }
+        const before = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.deepEqual(before.approvedSessionIds, []);
+        assert.deepEqual(before.pendingSessionIds, [targetId]);
+        const ctxB = {
+          ...approvalHandoverContext(harness),
+          sessionManager: { ...approvalHandoverContext(harness).sessionManager },
+          ui: { confirm: async () => { reboundCalls++; return false; } },
+        };
+        await harness.emitLifecycle("session_start", {}, ctxB);
+        const rebound = await readApprovalStatus(tool, ctxB, t.signal);
+        assert.equal(rebound.runtimeId, before.runtimeId);
+        assert.equal(rebound.generation, before.generation);
+        assert.deepEqual(rebound.approvedSessionIds, []);
+        assert.deepEqual(rebound.pendingSessionIds, [targetId]);
+        assert.equal(confirmationSignal!.aborted, false, "same-ID UI attachment does not abort the original operation signal");
+        assert.equal(askSettled, false);
+        const afterRebind = await startApprovalFollower(worker.id, () => tool.execute("approval-rebind-new-send-follower", {
+          action: "send", to: targetId, message: "New UI joins the existing decision",
+        }, signal, undefined, ctxB));
+        track("send", afterRebind.pending);
+        assert.equal(afterRebind.isPending(), true);
+        const blocked = await startApprovalFollower(worker.id, () => tool.execute("approval-rebind-blocked-pending-ask", {
+          action: "ask", to: targetId, message: "Must not replace the original pending ask owner",
+        }, signal, undefined, ctxB));
+        track("blocked-ask", blocked.pending);
+        assert.equal(blocked.isPending(), false, "ask ownership survives rebind before a reply waiter exists");
+        assert.match((await blocked.pending).content[0]!.text, /Already waiting/);
+        assert.equal(calls, 1);
+        assert.equal(reboundCalls, 0);
+        assert.equal(received.length, 0);
+
+        approval.resolve(true);
+        await waitForCondition(() => received.length === 4, "all approved shared messages arrive separately after rebind");
+        const question = received.find((message) => message.expectsReply)!;
+        assert.ok(question);
+        assert.equal(askSettled, false, "the shared ask still waits for its own answer");
+        const ctxC = { ...ctxB, sessionManager: { ...ctxB.sessionManager } };
+        await harness.emitLifecycle("session_start", {}, ctxC);
+        const delivered = await readApprovalStatus(tool, ctxC, t.signal);
+        assert.equal(delivered.runtimeId, before.runtimeId);
+        assert.equal(delivered.generation, before.generation);
+        assert.deepEqual(delivered.approvedSessionIds, [targetId]);
+        assert.deepEqual(delivered.pendingSessionIds, []);
+        assert.equal(askSettled, false, "rebind after delivery must not reject the live reply waiter");
+        const stillBlocked = await startApprovalFollower(worker.id, () => tool.execute("approval-rebind-blocked-delivered-ask", {
+          action: "ask", to: targetId, message: "Must not replace the delivered ask waiter",
+        }, signal, undefined, ctxC));
+        track("blocked-ask", stillBlocked.pending);
+        assert.equal(stillBlocked.isPending(), false);
+        assert.match((await stillBlocked.pending).content[0]!.text, /Already waiting/);
+        assert.equal((await planner.send(worker.id, { text: "Original shared ask answer after both rebinds", replyTo: question.id })).delivered, true);
+        for (const request of requests) {
+          const result = await request.pending;
+          if (request.action === "ask") assert.match(result.content[0]!.text, /Original shared ask answer after both rebinds/);
+          else if (request.action !== "blocked-ask") assert.equal(result.details?.delivered, true);
+        }
+        assert.equal(calls, 1);
+        assert.equal(reboundCalls, 0);
+        assert.equal(received.length, 4);
+        assert.equal(new Set(received.map((message) => message.id)).size, 4);
+        const endpoint = await waitForSessionId(planner, worker.id);
+        assert.ok(worker.endpointEpoch);
+        assert.equal(endpoint.endpointEpoch, worker.endpointEpoch);
+        assert.equal(endpoint.startedAt, worker.startedAt);
+      } finally {
+        controller.abort(); approval.resolve(false);
+        await Promise.allSettled(requests.map((request) => request.pending));
+      }
+    });
+  }
+});
+
+test("confirmProactive new source IDs and shutdown/start clear approved targets, including a source ID reused after shutdown", approvalTestOptions, async (t) => {
+  for (const reset of ["new-id-start", "shutdown-start"]) {
     let sourceId = "approval-source-before-reset";
     let calls = 0;
     await withApprovalHarness({ sessionId: () => sourceId, hasUI: true, ui: { confirm: async () => { calls++; return calls === 1; } } }, async ({ tool, harness, received }) => {
@@ -6091,9 +6442,18 @@ test("confirmProactive source session_start and shutdown/start clear approved ta
       }
       assert.equal(calls, 1);
       await waitForCondition(() => received.length === 2, "cached messages before source reset");
+      const before = await readApprovalStatus(tool, harness.ctx, t.signal);
+      assert.equal(before.sourceSessionId, sourceId);
+      assert.equal(before.approvedSessionIds.length, 1);
+      assert.deepEqual(before.pendingSessionIds, []);
       if (reset === "shutdown-start") await harness.emitLifecycle("session_shutdown");
       if (reset === "new-id-start") sourceId = "approval-source-after-reset";
       await harness.emitLifecycle("session_start");
+      const restarted = await readApprovalStatus(tool, harness.ctx, t.signal);
+      assert.equal(restarted.sourceSessionId, sourceId);
+      assert.ok(restarted.generation > before.generation, "a real source restart advances the runtime generation");
+      assert.deepEqual(restarted.approvedSessionIds, []);
+      assert.deepEqual(restarted.pendingSessionIds, []);
       const after = await tool.execute("approval-after-source-reset", { action: "send", to: "planner", message: "A new runtime must ask again" }, t.signal, undefined, harness.ctx);
       assert.equal(after.details?.declined, true, reset);
       assert.equal(calls, 2);
@@ -6119,6 +6479,10 @@ test("confirmProactive pool switches clear approved IDs and old reply contexts w
         const approved = await tool.execute("approval-before-pool-switch", { action: "send", to: targetId, message: "Approved only in the default pool" }, t.signal, undefined, harness.ctx);
         assert.equal(approved.details?.delivered, true);
         await waitForCondition(() => received.length === 1, "default-pool target receives its approved message");
+        const before = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.equal(before.pool, null);
+        assert.deepEqual(before.approvedSessionIds, [targetId]);
+        assert.deepEqual(before.pendingSessionIds, []);
         const oldAskId = "approval-old-pool-inbound-ask";
         assert.equal((await planner.send(worker.id, { messageId: oldAskId, text: "A default-pool reply context", expectsReply: true })).delivered, true);
         await waitForCondition(() => harness.sentMessages.some((entry) => (entry.message.details as { message?: Message })?.message?.id === oldAskId), "old-pool ask is tracked");
@@ -6128,6 +6492,11 @@ test("confirmProactive pool switches clear approved IDs and old reply contexts w
         const moved = await waitForSessionId(poolPeer, worker.id);
         await waitForNoSessionId(planner, worker.id);
         assert.equal(moved.startedAt, worker.startedAt, "a pool switch must not restart the whole source session");
+        const switched = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.equal(switched.pool, "approval-next-pool");
+        assert.equal(switched.sourceSessionId, before.sourceSessionId);
+        assert.deepEqual(switched.approvedSessionIds, []);
+        assert.deepEqual(switched.pendingSessionIds, []);
         const pending = await tool.execute("approval-pool-pending", { action: "pending" }, t.signal, undefined, harness.ctx);
         assert.equal(pending.content[0]?.text, "No unresolved inbound asks.");
         const staleReply = await tool.execute("approval-old-pool-reply", { action: "reply", replyTo: oldAskId, message: "Never answer an old-pool ask here" }, t.signal, undefined, harness.ctx);
@@ -6176,12 +6545,21 @@ test("confirmProactive pool switches abort shared pending approvals and ignore a
         requests.push(follower.pending);
         assert.equal(follower.isPending(), true);
         assert.equal(confirmationSignals.length, 1, "old-pool send and ask share their pending decision");
+        const before = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.equal(before.pool, null);
+        assert.deepEqual(before.approvedSessionIds, []);
+        assert.deepEqual(before.pendingSessionIds, [targetId]);
 
         await harness.commands.get("intercom-pool")!("approval-pending-pool", harness.ctx);
         assert.equal(notifications.at(-1), "Joined intercom pool: approval-pending-pool");
         assert.equal(confirmationSignals[0]!.aborted, true);
         assert.equal((await waitForSessionId(poolPeer, worker.id)).startedAt, worker.startedAt);
         for (const result of await Promise.all(requests)) assert.equal(result.details?.cancelled, true, "old-pool calls settle without waiting for the UI's late answer");
+        const switched = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.equal(switched.pool, "approval-pending-pool");
+        assert.equal(switched.sourceSessionId, before.sourceSessionId);
+        assert.deepEqual(switched.approvedSessionIds, []);
+        assert.deepEqual(switched.pendingSessionIds, []);
 
         let currentSettled = false;
         const current = tool.execute("approval-new-pool-ask", { action: "ask", to: targetId, message: "New pool needs an independent ask approval" }, t.signal, undefined, harness.ctx);
@@ -6194,6 +6572,9 @@ test("confirmProactive pool switches abort shared pending approvals and ignore a
         await new Promise((resolve) => setImmediate(resolve));
         assert.equal(currentSettled, false, "late old-pool true must not approve the new-pool follower");
         assert.equal(confirmationSignals[1]!.aborted, false);
+        const currentStatus = await readApprovalStatus(tool, harness.ctx, t.signal);
+        assert.deepEqual(currentStatus.approvedSessionIds, []);
+        assert.deepEqual(currentStatus.pendingSessionIds, [targetId], "the visible pending ID belongs only to the new-pool decision");
         newApproval.resolve(false);
         assert.equal((await current).details?.declined, true);
 
@@ -6265,6 +6646,41 @@ test("confirmProactive permission belongs to the sending runtime rather than a p
       assert.equal(firstCalls, 1);
       await waitForCondition(() => received.length === 2, "only the approved sender's calls arrive");
     } finally { await second.emitLifecycle("session_shutdown"); }
+  });
+});
+
+test("confirmProactive factory reload cannot restore a previous factory's cache even with the same source session ID", approvalTestOptions, async (t) => {
+  const sourceId = "approval-reloaded-source";
+  let firstCalls = 0;
+  let reloadedCalls = 0;
+  await withApprovalHarness({ sessionId: sourceId, hasUI: true, ui: { confirm: async () => { firstCalls++; return true; } } }, async ({ tool, harness, planner, worker, received }) => {
+    assert.equal((await tool.execute("approval-before-factory-reload", { action: "send", to: planner.sessionId!, message: "Approved only in the old factory" }, t.signal, undefined, harness.ctx)).details?.delivered, true);
+    await waitForCondition(() => received.length === 1, "old factory sends once before unload");
+    const before = await readApprovalStatus(tool, harness.ctx, t.signal);
+    assert.deepEqual(before.approvedSessionIds, [planner.sessionId!]);
+    await harness.emitLifecycle("session_shutdown");
+    await waitForNoSessionId(planner, worker.id);
+    const reloaded = createExtensionHarness("approval-reloaded-worker", {
+      sessionId: sourceId, hasUI: true,
+      ui: { confirm: async () => { reloadedCalls++; return false; } },
+    });
+    try {
+      const { default: extension } = await import("./index.ts");
+      extension(reloaded.pi as never);
+      await reloaded.emitLifecycle("session_start");
+      await waitForSessionByName(planner, "approval-reloaded-worker");
+      const otherTool = reloaded.tools.find((entry) => entry.name === "intercom")!;
+      const fresh = await readApprovalStatus(otherTool, reloaded.ctx, t.signal);
+      assert.equal(fresh.sourceSessionId, before.sourceSessionId);
+      assert.deepEqual(fresh.approvedSessionIds, []);
+      assert.deepEqual(fresh.pendingSessionIds, []);
+      const denied = await otherTool.execute("approval-after-factory-reload", { action: "send", to: planner.sessionId!, message: "Same source ID still needs a new factory's approval" }, t.signal, undefined, reloaded.ctx);
+      assert.equal(denied.details?.declined, true);
+      assert.equal(firstCalls, 1);
+      assert.equal(reloadedCalls, 1);
+      await planner.listSessions();
+      assert.equal(received.length, 1);
+    } finally { await reloaded.emitLifecycle("session_shutdown"); }
   });
 });
 
@@ -6595,8 +7011,9 @@ test("confirmProactive cancellation and session replacement invalidate pending a
       const approval = deferredApproval<boolean>();
       const controller = new AbortController();
       let confirmationSignal: AbortSignal | undefined;
+      let sourceId = "approval-interrupted-source";
       let calls = 0;
-      await withApprovalHarness({ hasUI: true, ui: {
+      await withApprovalHarness({ sessionId: () => sourceId, hasUI: true, ui: {
         confirm: (_title: string, _preview: string, options: { signal: AbortSignal }) => {
           if (++calls > 1) return Promise.resolve(false);
           confirmationSignal = options.signal;
@@ -6606,8 +7023,13 @@ test("confirmProactive cancellation and session replacement invalidate pending a
         try {
           const pending = tool.execute("approval-interrupt", { action, to: "planner", message: "Do not send late" }, AbortSignal.any([controller.signal, t.signal]), undefined, harness.ctx);
           await waitForCondition(() => Boolean(confirmationSignal), "confirmation is pending");
+          const before = await readApprovalStatus(tool, harness.ctx, t.signal);
+          assert.equal(before.pendingSessionIds.length, 1);
           if (interruption === "abort") controller.abort();
-          else await harness.emitLifecycle(interruption === "replace" ? "session_start" : "session_shutdown");
+          else if (interruption === "replace") {
+            sourceId = "approval-interrupted-replacement-source";
+            await harness.emitLifecycle("session_start");
+          } else await harness.emitLifecycle("session_shutdown");
           const result = await pending; // Must settle without waiting for the fake UI to answer.
           assert.equal(result.details?.cancelled, true);
           assert.equal(confirmationSignal!.aborted, true);
@@ -6615,6 +7037,11 @@ test("confirmProactive cancellation and session replacement invalidate pending a
           assert.equal(received.length, 0);
           assert.equal(harness.entries.filter((entry) => entry.type === "intercom_sent").length, 0);
           if (interruption === "shutdown") await harness.emitLifecycle("session_start");
+          const restarted = await readApprovalStatus(tool, harness.ctx, t.signal);
+          assert.equal(restarted.sourceSessionId, sourceId);
+          assert.deepEqual(restarted.approvedSessionIds, []);
+          assert.deepEqual(restarted.pendingSessionIds, []);
+          if (interruption !== "abort") assert.ok(restarted.generation > before.generation);
           const next = await tool.execute("approval-after-interrupt", { action: "send", to: "planner", message: "Still needs approval" }, t.signal, undefined, harness.ctx);
           assert.equal(next.details?.declined, true, "a late answer must not populate the approval cache");
           assert.equal(calls, 2);
@@ -6685,6 +7112,12 @@ test("confirmProactive leaves read-only tools and disabled-mode communication un
       const result = await tool.execute("approval-read-only", { action }, t.signal, undefined, harness.ctx);
       assert.notEqual(result.details?.error, true);
     }
+    const status = await readApprovalStatus(tool, harness.ctx, t.signal);
+    assert.equal(status.enabled, true);
+    assert.equal(status.confirmSend, false);
+    assert.equal(status.sourceSessionId, harness.ctx.sessionManager.getSessionId());
+    assert.deepEqual(status.approvedSessionIds, []);
+    assert.deepEqual(status.pendingSessionIds, []);
     assert.equal(calls, 0);
   });
   await withApprovalHarness({}, async ({ tool, harness, planner, received }) => {
@@ -6696,6 +7129,11 @@ test("confirmProactive leaves read-only tools and disabled-mode communication un
     });
     const asked = await tool.execute("approval-disabled-ask", { action: "ask", to: "planner", message: "Legacy ask" }, t.signal, undefined, harness.ctx);
     assert.match(asked.content[0]!.text, /Legacy answer/);
+    const status = await readApprovalStatus(tool, harness.ctx, t.signal);
+    assert.equal(status.enabled, false);
+    assert.equal(status.confirmSend, false);
+    assert.deepEqual(status.approvedSessionIds, []);
+    assert.deepEqual(status.pendingSessionIds, []);
   }, { confirmProactive: false });
 });
 

@@ -814,6 +814,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let outgoingRuntimeAbort = new AbortController();
   let intercomAskOwner: symbol | null = null;
   let approvalTail: Promise<void> = Promise.resolve();
+  const approvalRuntimeId = randomUUID();
   const approvedOutgoingSessions = new Set<string>();
   const pendingSessionApprovals = new Map<string, Promise<IntercomToolResult | null>>();
   // Share only the UI slot with legacy outbox confirmation; its approval policy stays unchanged.
@@ -1862,7 +1863,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     return findSessionTarget(await activeClient.listSessions(), nameOrId)?.id ?? null;
   }
   async function resolveDeliveryTarget(activeClient: IntercomClient, nameOrId: string): Promise<DeliveryTarget> {
-    const session = findSessionTarget(await activeClient.listSessions(), nameOrId);
+    const sessions = await activeClient.listSessions();
+    // A previously resolved full ID stays an ID when offline. Never downgrade it
+    // to a name/prefix or a mailbox that may remap to another session.
+    if (approvedOutgoingSessions.has(nameOrId) || pendingSessionApprovals.has(nameOrId)) {
+      const session = sessions.find((entry) => entry.id === nameOrId);
+      return { id: nameOrId, label: session?.name || nameOrId, approvalSessionId: nameOrId };
+    }
+    const session = findSessionTarget(sessions, nameOrId);
     return session
       ? { id: session.id, label: session.name || session.id, approvalSessionId: session.id }
       : { id: nameOrId, label: nameOrId };
@@ -2261,6 +2269,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     });
   }
   function startSessionRuntime(ctx: ExtensionContext): void {
+    const sourceSessionId = ctx.sessionManager.getSessionId();
+    // SDK bindExtensions() re-emits session_start when only the UI is rebound.
+    // The same live source session still owns its approvals and pending work.
+    if (runtimeStarted && !disposed && !shuttingDown && currentSessionId === sourceSessionId) {
+      runtimeContext = ctx;
+      syncPresenceIdentity(sourceSessionId);
+      return;
+    }
     outgoingRuntimeAbort.abort();
     outgoingRuntimeAbort = new AbortController();
     intercomAskOwner = null;
@@ -2285,7 +2301,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       void previousClient.disconnect().catch(() => undefined);
     }
     runtimeContext = ctx;
-    currentSessionId = ctx.sessionManager.getSessionId();
+    currentSessionId = sourceSessionId;
     let claimedIntercomSessionId: string | undefined;
     const identityRequest: IntercomSessionIdentityRequestV1 = {
       version: 1,
@@ -3291,12 +3307,23 @@ Usage:
             const pool = getIntercomScopeId();
             const mySession = sessions.find((session) => session.id === mySessionId);
             const shortId = (mySessionId ?? "unknown").slice(0, 8);
+            const approval = {
+              policy: "session-id-v2",
+              enabled: config.confirmProactive,
+              confirmSend: config.confirmSend,
+              runtimeId: approvalRuntimeId,
+              generation: runtimeGeneration,
+              sourceSessionId: currentSessionId,
+              pool: pool ?? null,
+              approvedSessionIds: [...approvedOutgoingSessions],
+              pendingSessionIds: [...pendingSessionApprovals.keys()],
+            };
             return {
               content: [{
                 type: "text",
-                text: `**Intercom status:**\nConnected: Yes\nSession ID: ${mySessionId}\nSession name: ${mySession?.name ?? "(unnamed)"} (short id: ${shortId})${pool ? `\nPool: ${pool}` : ""}\nActive sessions: ${sessions.length}`,
+                text: `**Intercom status:**\nConnected: Yes\nSession ID: ${mySessionId}\nSession name: ${mySession?.name ?? "(unnamed)"} (short id: ${shortId})${pool ? `\nPool: ${pool}` : ""}\nActive sessions: ${sessions.length}\nApproval policy: ${config.confirmProactive ? "once per target session ID" : "disabled"} (${approval.policy})\nApproved targets: ${approval.approvedSessionIds.length}\nPending approvals: ${approval.pendingSessionIds.length}\nApproval runtime: ${approval.runtimeId} (generation ${approval.generation})`,
               }],
-              details: {},
+              details: { approval },
             };
           } catch (error) {
             return {
